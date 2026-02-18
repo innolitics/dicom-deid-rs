@@ -32,9 +32,9 @@ mod tests {
     use crate::filter;
     use crate::recipe::*;
     use crate::test_helpers::*;
-    use dicom_core::{Tag, VR};
-    use dicom_core::value::{PrimitiveValue, Value};
     use dicom_core::DataElement;
+    use dicom_core::value::{PrimitiveValue, Value};
+    use dicom_core::{Tag, VR};
     use dicom_dictionary_std::tags;
 
     /// Helper to create a minimal DICOM object with pixel data.
@@ -45,7 +45,12 @@ mod tests {
         let mut obj = create_test_obj();
         put_u16(&mut obj, tags::ROWS, VR::US, rows);
         put_u16(&mut obj, tags::COLUMNS, VR::US, cols);
-        put_str(&mut obj, tags::PHOTOMETRIC_INTERPRETATION, VR::CS, "MONOCHROME2");
+        put_str(
+            &mut obj,
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "MONOCHROME2",
+        );
         put_u16(&mut obj, tags::BITS_ALLOCATED, VR::US, 8);
         put_u16(&mut obj, tags::BITS_STORED, VR::US, 8);
         put_u16(&mut obj, tags::HIGH_BIT, VR::US, 7);
@@ -81,7 +86,9 @@ mod tests {
 
         apply_pixel_mask(&mut obj, &regions).expect("should succeed");
 
-        let elem = obj.element(tags::PIXEL_DATA).expect("pixel data should exist");
+        let elem = obj
+            .element(tags::PIXEL_DATA)
+            .expect("pixel data should exist");
         let bytes = elem.value().to_bytes().expect("should read pixel bytes");
 
         // The top-left 2x2 region (rows 0-1, cols 0-1) should be black (0)
@@ -154,7 +161,9 @@ mod tests {
 
         apply_pixel_mask(&mut obj, &regions).expect("should succeed");
 
-        let elem = obj.element(tags::PIXEL_DATA).expect("pixel data should exist");
+        let elem = obj
+            .element(tags::PIXEL_DATA)
+            .expect("pixel data should exist");
         let bytes = elem.value().to_bytes().expect("should read pixel bytes");
 
         // Keep region (0,0)-(2,2) should remain 255
@@ -191,7 +200,9 @@ mod tests {
 
         apply_pixel_mask(&mut obj, &regions).expect("should succeed");
 
-        let elem = obj.element(tags::PIXEL_DATA).expect("pixel data should exist");
+        let elem = obj
+            .element(tags::PIXEL_DATA)
+            .expect("pixel data should exist");
         let bytes = elem.value().to_bytes().expect("should read pixel bytes");
 
         // First region: row 0, col 0 should be masked
@@ -277,6 +288,10 @@ mod tests {
         };
 
         let regions = filter::get_graylist_regions(&recipe, &obj);
-        assert_eq!(regions.len(), 1, "matching filter should return its regions");
+        assert_eq!(
+            regions.len(),
+            1,
+            "matching filter should return its regions"
+        );
     }
 }

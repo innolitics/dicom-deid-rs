@@ -85,12 +85,7 @@ mod tests {
     #[test]
     fn r3_1_add_does_not_overwrite_existing() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::PATIENT_ID,
-            VR::LO,
-            "ORIGINAL",
-        );
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![HeaderAction {
             action_type: ActionType::Add,
@@ -103,7 +98,9 @@ mod tests {
 
         // ADD should only add if not present; if present, the value should remain.
         // (This behavior can be adjusted per CTP reference.)
-        let elem = obj.element(tags::PATIENT_ID).expect("tag should be present");
+        let elem = obj
+            .element(tags::PATIENT_ID)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         // ADD on existing tag: CTP adds/overwrites. Verify it's set.
         assert!(val.as_ref() == "ORIGINAL" || val.as_ref() == "NEW");
@@ -126,7 +123,9 @@ mod tests {
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
 
-        let elem = obj.element(tags::PATIENT_ID).expect("tag should be present");
+        let elem = obj
+            .element(tags::PATIENT_ID)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         assert_eq!(val.as_ref(), "REPLACED_ID");
     }
@@ -137,12 +136,7 @@ mod tests {
     #[test]
     fn r3_3_delete_tag() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::OPERATORS_NAME,
-            VR::PN,
-            "Dr. Smith",
-        );
+        put_str(&mut obj, tags::OPERATORS_NAME, VR::PN, "Dr. Smith");
 
         let actions = vec![HeaderAction {
             action_type: ActionType::Remove,
@@ -200,12 +194,7 @@ mod tests {
     #[test]
     fn r3_6_unknown_function_returns_error() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::SOP_INSTANCE_UID,
-            VR::UI,
-            "1.2.3.4",
-        );
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
 
         let actions = vec![HeaderAction {
             action_type: ActionType::Replace,
@@ -215,8 +204,7 @@ mod tests {
             }),
         }];
 
-        let result =
-            apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
+        let result = apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
         assert!(result.is_err(), "unknown function should produce an error");
     }
 
@@ -237,7 +225,9 @@ mod tests {
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
 
-        let elem = obj.element(tags::STUDY_DATE).expect("tag should be present");
+        let elem = obj
+            .element(tags::STUDY_DATE)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         assert_eq!(val.as_ref(), "20200120");
     }
@@ -257,7 +247,9 @@ mod tests {
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
 
-        let elem = obj.element(tags::STUDY_DATE).expect("tag should be present");
+        let elem = obj
+            .element(tags::STUDY_DATE)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         assert_eq!(val.as_ref(), "20200204");
     }
@@ -277,7 +269,9 @@ mod tests {
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
 
-        let elem = obj.element(tags::STUDY_DATE).expect("tag should be present");
+        let elem = obj
+            .element(tags::STUDY_DATE)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         assert_eq!(val.as_ref(), "20191226");
     }
@@ -299,10 +293,11 @@ mod tests {
             value: Some(ActionValue::Variable("NEWID".into())),
         }];
 
-        apply_header_actions(&actions, &vars, &empty_funcs(), &mut obj)
-            .expect("should succeed");
+        apply_header_actions(&actions, &vars, &empty_funcs(), &mut obj).expect("should succeed");
 
-        let elem = obj.element(tags::PATIENT_ID).expect("tag should be present");
+        let elem = obj
+            .element(tags::PATIENT_ID)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
         assert_eq!(val.as_ref(), "ANON-001");
     }
@@ -319,8 +314,7 @@ mod tests {
             value: Some(ActionValue::Variable("UNDEFINED".into())),
         }];
 
-        let result =
-            apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
+        let result = apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
         assert!(
             result.is_err(),
             "referencing undefined variable should produce an error"
@@ -333,12 +327,7 @@ mod tests {
     #[test]
     fn r3_9_blank_tag_clears_value_but_keeps_tag() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::PATIENT_NAME,
-            VR::PN,
-            "John^Doe",
-        );
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![HeaderAction {
             action_type: ActionType::Blank,
@@ -362,12 +351,7 @@ mod tests {
     #[test]
     fn r3_10_keep_preserves_original_value() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::PATIENT_NAME,
-            VR::PN,
-            "John^Doe",
-        );
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         // Both a KEEP and a REMOVE targeting the same field
         let actions = vec![
@@ -445,9 +429,15 @@ mod tests {
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
 
-        let elem = obj.element(tags::PATIENT_ID).expect("tag should be present");
+        let elem = obj
+            .element(tags::PATIENT_ID)
+            .expect("tag should be present");
         let val = elem.value().to_str().expect("should read value");
-        assert_eq!(val.as_ref(), "ADDED", "ADD should take precedence over REPLACE");
+        assert_eq!(
+            val.as_ref(),
+            "ADDED",
+            "ADD should take precedence over REPLACE"
+        );
     }
 
     /// Requirement r-3-11: REPLACE > JITTER
@@ -516,12 +506,7 @@ mod tests {
     #[test]
     fn r3_11_remove_beats_blank() {
         let mut obj = create_test_obj();
-        put_str(
-            &mut obj,
-            tags::PATIENT_NAME,
-            VR::PN,
-            "John^Doe",
-        );
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![
             HeaderAction {
@@ -550,9 +535,7 @@ mod tests {
     fn r3_11_full_precedence_hierarchy() {
         assert!(action_precedence(&ActionType::Keep) < action_precedence(&ActionType::Add));
         assert!(action_precedence(&ActionType::Add) < action_precedence(&ActionType::Replace));
-        assert!(
-            action_precedence(&ActionType::Replace) < action_precedence(&ActionType::Jitter)
-        );
+        assert!(action_precedence(&ActionType::Replace) < action_precedence(&ActionType::Jitter));
         assert!(action_precedence(&ActionType::Jitter) < action_precedence(&ActionType::Remove));
         assert!(action_precedence(&ActionType::Remove) < action_precedence(&ActionType::Blank));
     }
@@ -569,30 +552,10 @@ mod tests {
         put_str(&mut obj, tags::MODALITY, VR::CS, "CT");
 
         // Private tags (odd group numbers)
-        put_str(
-            &mut obj,
-            Tag(0x0009, 0x0010),
-            VR::LO,
-            "PRIVATE CREATOR A",
-        );
-        put_str(
-            &mut obj,
-            Tag(0x0009, 0x1001),
-            VR::LO,
-            "private data A",
-        );
-        put_str(
-            &mut obj,
-            Tag(0x0033, 0x0010),
-            VR::LO,
-            "PRIVATE CREATOR B",
-        );
-        put_str(
-            &mut obj,
-            Tag(0x0033, 0x1001),
-            VR::LO,
-            "private data B",
-        );
+        put_str(&mut obj, Tag(0x0009, 0x0010), VR::LO, "PRIVATE CREATOR A");
+        put_str(&mut obj, Tag(0x0009, 0x1001), VR::LO, "private data A");
+        put_str(&mut obj, Tag(0x0033, 0x0010), VR::LO, "PRIVATE CREATOR B");
+        put_str(&mut obj, Tag(0x0033, 0x1001), VR::LO, "private data B");
 
         remove_private_tags(&mut obj);
 

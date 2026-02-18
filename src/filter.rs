@@ -1,4 +1,6 @@
-use crate::recipe::{Condition, CoordinateRegion, FilterLabel, FilterType, LogicalOp, Predicate, Recipe};
+use crate::recipe::{
+    Condition, CoordinateRegion, FilterLabel, FilterType, LogicalOp, Predicate, Recipe,
+};
 use dicom_object::InMemDicomObject;
 
 /// Evaluate a single filter predicate against a DICOM object.
@@ -31,10 +33,7 @@ pub fn is_blacklisted(recipe: &Recipe, obj: &InMemDicomObject) -> bool {
 
 /// Collect all coordinate regions from graylist filters whose conditions match
 /// the given DICOM object.
-pub fn get_graylist_regions(
-    recipe: &Recipe,
-    obj: &InMemDicomObject,
-) -> Vec<CoordinateRegion> {
+pub fn get_graylist_regions(recipe: &Recipe, obj: &InMemDicomObject) -> Vec<CoordinateRegion> {
     todo!()
 }
 

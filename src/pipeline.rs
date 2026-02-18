@@ -94,8 +94,7 @@ mod tests {
     #[test]
     fn r1_2_empty_directory_returns_empty() {
         let tmp = TempDir::new().expect("should create temp dir");
-        let files =
-            DeidPipeline::find_dicom_files(tmp.path()).expect("should handle empty dir");
+        let files = DeidPipeline::find_dicom_files(tmp.path()).expect("should handle empty dir");
         assert!(files.is_empty());
     }
 
@@ -106,14 +105,13 @@ mod tests {
     fn r6_1_library_api_is_accessible() {
         // Verify that the core library types can be constructed and used
         // programmatically, confirming the software is designed as a library.
-        use crate::recipe::{
-            ActionType, ActionValue, CoordinateRegion, Condition, FilterLabel,
-            FilterSection, FilterType, HeaderAction, LogicalOp, Predicate, Recipe,
-            TagSpecifier,
-        };
         use crate::filter::{evaluate_conditions, is_blacklisted};
         use crate::metadata::apply_header_actions;
         use crate::pixel::apply_pixel_mask;
+        use crate::recipe::{
+            ActionType, ActionValue, Condition, CoordinateRegion, FilterLabel, FilterSection,
+            FilterType, HeaderAction, LogicalOp, Predicate, Recipe, TagSpecifier,
+        };
 
         // Construct a recipe programmatically
         let recipe = Recipe {
