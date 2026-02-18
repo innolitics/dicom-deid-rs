@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dicom-object = "0.8"
+dicom-core = "0.8"
+dicom-dictionary-std = "0.8"
+regex = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
