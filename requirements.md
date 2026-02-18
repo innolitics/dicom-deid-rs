@@ -65,3 +65,4 @@ r-5-1 The software must support excluding DICOM files from processing entirely b
 
 r-6 Embeddability
 r-6-1 The software must be designed as a library, with the main rust entrypoint being a command-line interface to the library.
+r-6-2 The software must provide an API for supplying additional functions and variables that can be referenced within the recipe file, allowing for extensibility and custom logic to be injected at runtime.
