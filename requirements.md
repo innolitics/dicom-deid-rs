@@ -2,6 +2,8 @@ r-1 Inputs and Outputs
 r-1-1 The software must accept a path to a directory of DICOM files as an input, a path to the output directory, and a path to the recipe file.
 r-1-2 The software must recursively search the input directory for all DICOM files
 r-1-3 The software must display a progress bar on the console as it processes input files
+r-1-4 The software must preserve the relative directory structure of input files in the output directory (e.g., input/sub/file.dcm → output/sub/file.dcm)
+r-1-5 The software must continue processing remaining files when an individual file fails, logging a warning and counting the file as skipped in the final report
 
 r-2 De-id Recipe Specification
 r-2-1 The software must parse a de-identification recipe file defining the deid operations to be performed
@@ -45,7 +47,7 @@ r-3-4-2 The software must support specifying a tag by its tag value in parenthes
 r-3-4-3 The software must support specifying private tags by its group, private creator, and element offset
 r-3-5 The software must support pattern matching of tags based on regexes of tag keywords or tag values, and applying deid operations to all tags matching the pattern
 r-3-6 The software must support the use of pre-defined functions referenced via func:<name> syntax in the recipe to execute logic. Functions may accept keyword arguments.
-r-3-7 The software must support applying a "jitter" to date and datetime fields to shift the value by the specified number of days
+r-3-7 The software must support applying a "jitter" to date and datetime fields to shift the value by the specified number of days. DateTime (DT) fields must also be supported, preserving the time component while shifting only the date portion. Jittering a blank or empty date field must be a no-op (no error).
 r-3-8 The software must support referencing variables within the recipe via var:<NAME> syntax to allow for dynamic values
 r-3-9 The software must support blanking a DICOM tag (setting its value to empty/null) while keeping the tag present in the file
 r-3-10 The software must support explicitly keeping a tag's original value unchanged, protecting it from removal by broader rules

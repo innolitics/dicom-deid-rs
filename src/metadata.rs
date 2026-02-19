@@ -78,11 +78,22 @@ pub fn apply_header_actions(
                     .value()
                     .to_str()
                     .map_err(|e| DeidError::Dicom(format!("cannot read date for jitter: {}", e)))?;
-                let date = NaiveDate::parse_from_str(current.trim(), "%Y%m%d")
+                let trimmed = current.trim();
+                // Blank/empty dates are a no-op
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Extract date portion (first 8 chars) and any time suffix (DT format)
+                let (date_part, time_suffix) = if trimmed.len() > 8 {
+                    (&trimmed[..8], &trimmed[8..])
+                } else {
+                    (trimmed, "")
+                };
+                let date = NaiveDate::parse_from_str(date_part, "%Y%m%d")
                     .map_err(|e| DeidError::Dicom(format!("invalid date for jitter: {}", e)))?;
                 let shifted = date + chrono::Duration::days(days);
                 let vr = lookup_vr(obj, *tag);
-                let formatted = shifted.format("%Y%m%d").to_string();
+                let formatted = format!("{}{}", shifted.format("%Y%m%d"), time_suffix);
                 obj.put(DataElement::new(
                     *tag,
                     vr,
@@ -729,6 +740,892 @@ mod tests {
         assert!(
             obj.element(Tag(0x0010, 0x0020)).is_ok(),
             "even-group tags should be preserved"
+        );
+    }
+
+    // ========================================================================
+    // E2E Behavioral Tests — Category 1: Action Interaction Matrix
+    // ========================================================================
+    // These test all non-adjacent precedence pairs and same-type duplicates,
+    // validating the Rust precedence model: KEEP(0) > ADD(1) > REPLACE(2) >
+    // JITTER(3) > REMOVE(4) > BLANK(5).
+    // Python deid processes actions sequentially; these tests verify the
+    // precedence-based approach instead.
+
+    #[test]
+    fn interaction_keep_beats_add() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("ADDED".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "ORIGINAL", "KEEP should beat ADD");
+    }
+
+    #[test]
+    fn interaction_keep_beats_jitter() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("5".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "20200115", "KEEP should beat JITTER");
+    }
+
+    #[test]
+    fn interaction_keep_beats_blank() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("PatientName".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("PatientName".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_NAME)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "John^Doe", "KEEP should beat BLANK");
+    }
+
+    #[test]
+    fn interaction_add_beats_jitter() {
+        let mut obj = create_test_obj();
+        // Tag not present — ADD will create it, JITTER would fail if it won
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("ADDED_VAL".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("5".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "ADDED_VAL", "ADD should beat JITTER");
+    }
+
+    #[test]
+    fn interaction_add_beats_remove() {
+        let mut obj = create_test_obj();
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("ADDED_VAL".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "ADDED_VAL", "ADD should beat REMOVE");
+    }
+
+    #[test]
+    fn interaction_add_beats_blank() {
+        let mut obj = create_test_obj();
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("ADDED_VAL".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "ADDED_VAL", "ADD should beat BLANK");
+    }
+
+    #[test]
+    fn interaction_replace_beats_remove() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("REPLACED".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "REPLACED", "REPLACE should beat REMOVE");
+    }
+
+    #[test]
+    fn interaction_replace_beats_blank() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("REPLACED".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "REPLACED", "REPLACE should beat BLANK");
+    }
+
+    #[test]
+    fn interaction_jitter_beats_blank() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("5".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "20200120", "JITTER should beat BLANK");
+    }
+
+    #[test]
+    fn interaction_duplicate_add_first_wins() {
+        let mut obj = create_test_obj();
+        // PatientID not present, so ADD will create it
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("FIRST".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("SECOND".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "FIRST",
+            "first ADD should win when same precedence"
+        );
+    }
+
+    #[test]
+    fn interaction_duplicate_replace_first_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("FIRST".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("SECOND".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "FIRST",
+            "first REPLACE should win when same precedence"
+        );
+    }
+
+    // ========================================================================
+    // E2E Behavioral Tests — Category 2: Compound Multi-Action Scenarios
+    // ========================================================================
+    // Tests with 3+ actions on the same or related tags, including
+    // Pattern(".*")-based "remove all" combined with other actions.
+
+    #[test]
+    fn compound_remove_all_keep_one_field() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "12345");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert!(
+            obj.element(tags::STUDY_DATE).is_ok(),
+            "KEEP should protect StudyDate from REMOVE-all"
+        );
+        assert!(
+            obj.element(tags::PATIENT_NAME).is_err(),
+            "PatientName should be removed"
+        );
+        assert!(
+            obj.element(tags::PATIENT_ID).is_err(),
+            "PatientID should be removed"
+        );
+    }
+
+    #[test]
+    fn compound_remove_all_add_new_field() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
+                value: Some(ActionValue::Literal("YES".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert!(
+            obj.element(tags::PATIENT_NAME).is_err(),
+            "PatientName should be removed"
+        );
+        let val = obj
+            .element_by_name("PatientIdentityRemoved")
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "YES",
+            "ADD should override REMOVE for new tag"
+        );
+    }
+
+    #[test]
+    fn compound_remove_all_replace_one() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("19700101".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "19700101",
+            "REPLACE should beat REMOVE for StudyDate"
+        );
+        assert!(
+            obj.element(tags::PATIENT_NAME).is_err(),
+            "PatientName should be removed"
+        );
+    }
+
+    #[test]
+    fn compound_remove_all_jitter_one() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("1".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20200116",
+            "JITTER should beat REMOVE for StudyDate"
+        );
+        assert!(
+            obj.element(tags::PATIENT_NAME).is_err(),
+            "PatientName should be removed"
+        );
+    }
+
+    #[test]
+    fn compound_remove_all_keep_and_replace_keep_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+        put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("19700101".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20200115",
+            "KEEP should beat both REPLACE and REMOVE"
+        );
+    }
+
+    #[test]
+    fn compound_remove_all_keep_and_jitter_keep_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Pattern(".*".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("1".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20200115",
+            "KEEP should beat both JITTER and REMOVE"
+        );
+    }
+
+    #[test]
+    fn compound_blank_and_keep_preserves_original() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
+                value: Some(ActionValue::Literal("YES".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20200115",
+            "KEEP should beat BLANK, preserving original"
+        );
+    }
+
+    #[test]
+    fn compound_remove_and_replace_replace_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("19700101".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "19700101", "REPLACE should beat REMOVE");
+    }
+
+    #[test]
+    fn compound_remove_and_jitter_jitter_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("1".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "20200116", "JITTER should beat REMOVE");
+    }
+
+    #[test]
+    fn compound_remove_and_keep_keep_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "20200115", "KEEP should beat REMOVE");
+    }
+
+    #[test]
+    fn compound_add_and_remove_add_wins() {
+        let mut obj = create_test_obj();
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("NEW_VAL".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "NEW_VAL", "ADD should beat REMOVE");
+    }
+
+    #[test]
+    fn compound_remove_and_add_add_wins() {
+        // Same as above but reversed action order — precedence is order-independent
+        let mut obj = create_test_obj();
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Add,
+                tag: TagSpecifier::Keyword("PatientID".into()),
+                value: Some(ActionValue::Literal("NEW_VAL".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::PATIENT_ID)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "NEW_VAL",
+            "ADD should beat REMOVE regardless of order"
+        );
+    }
+
+    #[test]
+    fn compound_jitter_replace_replace_wins() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("1".into())),
+            },
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("19700101".into())),
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "19700101", "REPLACE should beat JITTER");
+    }
+
+    // ========================================================================
+    // E2E Behavioral Tests — Category 3: JITTER Edge Cases
+    // ========================================================================
+
+    #[test]
+    fn jitter_datetime_preserves_time() {
+        let mut obj = create_test_obj();
+        // DT (DateTime) VR — DICOM format: YYYYMMDDHHMMSS.FFFFFF
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20230101011721.621000");
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Jitter,
+            tag: TagSpecifier::Keyword("StudyDate".into()),
+            value: Some(ActionValue::Literal("1".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20230102011721.621000",
+            "JITTER on DT should shift date and preserve time portion"
+        );
+    }
+
+    #[test]
+    fn jitter_empty_date_is_noop() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::STUDY_DATE, VR::DA, "");
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Jitter,
+            tag: TagSpecifier::Keyword("StudyDate".into()),
+            value: Some(ActionValue::Literal("1".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed — blank date is a no-op");
+
+        let val = obj
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "",
+            "JITTER on blank date should leave it unchanged"
+        );
+    }
+
+    #[test]
+    fn jitter_private_tag() {
+        let mut obj = create_test_obj();
+        let private_tag = Tag(0x0029, 0x1019);
+        put_str(&mut obj, private_tag, VR::DA, "20230101");
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Jitter,
+            tag: TagSpecifier::TagValue(private_tag),
+            value: Some(ActionValue::Literal("1".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let val = obj.element(private_tag).unwrap().value().to_str().unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "20230102",
+            "JITTER should work on private tags"
         );
     }
 }

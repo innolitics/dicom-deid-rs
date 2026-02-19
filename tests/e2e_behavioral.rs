@@ -1,0 +1,473 @@
+//! End-to-end behavioral tests ported from the Python deid reference implementation.
+//!
+//! Category 4: Tag format integration — recipe text parsed end-to-end.
+//! Category 5: Pipeline-level E2E — blacklist, multi-file, graylist pixel masking.
+
+use dicom_core::value::{PrimitiveValue, Value};
+use dicom_core::{DataElement, Tag, VR};
+use dicom_dictionary_std::tags;
+use dicom_object::meta::FileMetaTableBuilder;
+use dicom_object::{FileDicomObject, InMemDicomObject, open_file};
+use std::collections::HashMap;
+use std::fs;
+use tempfile::TempDir;
+
+use dicom_deid_rs::metadata::{DeidFunction, apply_header_actions};
+use dicom_deid_rs::pipeline::{DeidConfig, DeidPipeline};
+use dicom_deid_rs::recipe::Recipe;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn create_test_obj() -> InMemDicomObject {
+    InMemDicomObject::new_empty()
+}
+
+fn put_str(obj: &mut InMemDicomObject, tag: Tag, vr: VR, value: &str) {
+    obj.put(DataElement::new(
+        tag,
+        vr,
+        Value::Primitive(PrimitiveValue::from(value)),
+    ));
+}
+
+fn create_test_file_obj() -> FileDicomObject<InMemDicomObject> {
+    FileDicomObject::new_empty_with_meta(
+        FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.9")
+            .implementation_class_uid("1.2.3.4")
+            .build()
+            .expect("valid file meta"),
+    )
+}
+
+fn empty_vars() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+fn empty_funcs() -> HashMap<String, DeidFunction> {
+    HashMap::new()
+}
+
+// ============================================================================
+// Category 4: Tag Format Integration
+// ============================================================================
+// Full recipe-text-to-output tests verifying different tag format syntax.
+
+#[test]
+fn tag_format_remove_via_keyword() {
+    let mut obj = create_test_obj();
+    put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+    let recipe_text = "FORMAT dicom\n%header\nREMOVE PatientName\n";
+    let recipe = Recipe::parse(recipe_text).expect("should parse");
+
+    apply_header_actions(&recipe.header, &empty_vars(), &empty_funcs(), &mut obj)
+        .expect("should succeed");
+
+    assert!(
+        obj.element(tags::PATIENT_NAME).is_err(),
+        "PatientName should be removed via keyword"
+    );
+}
+
+#[test]
+fn tag_format_remove_via_hex() {
+    let mut obj = create_test_obj();
+    put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+    let recipe_text = "FORMAT dicom\n%header\nREMOVE 00100010\n";
+    let recipe = Recipe::parse(recipe_text).expect("should parse");
+
+    apply_header_actions(&recipe.header, &empty_vars(), &empty_funcs(), &mut obj)
+        .expect("should succeed");
+
+    assert!(
+        obj.element(tags::PATIENT_NAME).is_err(),
+        "PatientName should be removed via bare hex"
+    );
+}
+
+#[test]
+fn tag_format_remove_via_dicom_format() {
+    let mut obj = create_test_obj();
+    put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+    let recipe_text = "FORMAT dicom\n%header\nREMOVE (0010,0010)\n";
+    let recipe = Recipe::parse(recipe_text).expect("should parse");
+
+    apply_header_actions(&recipe.header, &empty_vars(), &empty_funcs(), &mut obj)
+        .expect("should succeed");
+
+    assert!(
+        obj.element(tags::PATIENT_NAME).is_err(),
+        "PatientName should be removed via (GGGG,EEEE) format"
+    );
+}
+
+#[test]
+fn tag_format_replace_via_keyword_and_hex() {
+    let mut obj = create_test_obj();
+    put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL_ID");
+    // Private tag at (0019,0010)
+    put_str(&mut obj, Tag(0x0019, 0x0010), VR::LO, "OLD_PRIVATE");
+
+    let recipe_text = "FORMAT dicom\n%header\nREPLACE PatientID ANON\nREPLACE 00190010 NEW\n";
+    let recipe = Recipe::parse(recipe_text).expect("should parse");
+
+    apply_header_actions(&recipe.header, &empty_vars(), &empty_funcs(), &mut obj)
+        .expect("should succeed");
+
+    let pid = obj
+        .element(tags::PATIENT_ID)
+        .unwrap()
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(pid.as_ref(), "ANON", "keyword REPLACE should work");
+
+    let priv_val = obj
+        .element(Tag(0x0019, 0x0010))
+        .unwrap()
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(priv_val.as_ref(), "NEW", "hex REPLACE should work");
+}
+
+#[test]
+fn tag_format_add_via_hex_private_tag() {
+    let mut obj = create_test_obj();
+
+    let recipe_text = "FORMAT dicom\n%header\nADD 11112221 SIMPSON\n";
+    let recipe = Recipe::parse(recipe_text).expect("should parse");
+
+    apply_header_actions(&recipe.header, &empty_vars(), &empty_funcs(), &mut obj)
+        .expect("should succeed");
+
+    let val = obj
+        .element(Tag(0x1111, 0x2221))
+        .unwrap()
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        val.as_ref(),
+        "SIMPSON",
+        "ADD via hex should create private tag with value"
+    );
+}
+
+// ============================================================================
+// Category 5: Pipeline-Level E2E
+// ============================================================================
+
+#[test]
+fn pipeline_blacklist_excludes_file() {
+    let tmp = TempDir::new().expect("should create temp dir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+
+    // CT file — should pass through
+    let mut ct_file = create_test_file_obj();
+    put_str(&mut ct_file, tags::MODALITY, VR::CS, "CT");
+    put_str(&mut ct_file, tags::PATIENT_NAME, VR::PN, "John^Doe");
+    ct_file
+        .write_to_file(input_dir.join("ct.dcm"))
+        .expect("write CT file");
+
+    // SR file — should be blacklisted
+    let mut sr_file = FileDicomObject::new_empty_with_meta(
+        FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.88.11")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.10")
+            .implementation_class_uid("1.2.3.4")
+            .build()
+            .expect("valid file meta"),
+    );
+    put_str(&mut sr_file, tags::MODALITY, VR::CS, "SR");
+    put_str(&mut sr_file, tags::PATIENT_NAME, VR::PN, "Jane^Doe");
+    sr_file
+        .write_to_file(input_dir.join("sr.dcm"))
+        .expect("write SR file");
+
+    // Recipe with blacklist for SR
+    let recipe_path = tmp.path().join("recipe.txt");
+    fs::write(
+        &recipe_path,
+        "\
+FORMAT dicom
+
+%filter blacklist
+
+LABEL Reject SR
+equals Modality SR
+
+%header
+
+REPLACE PatientName ANON
+",
+    )
+    .expect("write recipe");
+
+    let config = DeidConfig {
+        input_dir: input_dir.clone(),
+        output_dir: output_dir.clone(),
+        recipe_path,
+        variables: HashMap::new(),
+        functions: HashMap::new(),
+    };
+
+    let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+    let report = pipeline.run().expect("should run pipeline");
+
+    assert_eq!(report.files_processed, 1, "only CT should be processed");
+    assert_eq!(report.files_blacklisted, 1, "SR should be blacklisted");
+
+    // CT file should exist in output
+    let ct_output = output_dir.join("ct.dcm");
+    assert!(ct_output.exists(), "CT output file should exist");
+
+    // SR file should NOT exist in output
+    let sr_output = output_dir.join("sr.dcm");
+    assert!(!sr_output.exists(), "SR output file should not exist");
+
+    // Verify CT was de-identified
+    let result = open_file(&ct_output).expect("should open CT output");
+    let name = result
+        .element_by_name("PatientName")
+        .expect("should have PatientName");
+    let val = name.value().to_str().expect("should read value");
+    assert_eq!(val.as_ref(), "ANON");
+}
+
+#[test]
+fn pipeline_multiple_files_nested_dirs() {
+    let tmp = TempDir::new().expect("should create temp dir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+
+    // Create nested directory structure
+    let sub1 = input_dir.join("sub1");
+    let sub2 = input_dir.join("sub1").join("sub2");
+    fs::create_dir_all(&sub2).expect("create nested dirs");
+
+    // Create 3 DICOM files in different locations
+    for (dir, name, uid_suffix) in [
+        (input_dir.as_path(), "root.dcm", "1"),
+        (sub1.as_path(), "level1.dcm", "2"),
+        (sub2.as_path(), "level2.dcm", "3"),
+    ] {
+        let mut file_obj = FileDicomObject::new_empty_with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax("1.2.840.10008.1.2.1")
+                .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+                .media_storage_sop_instance_uid(format!("1.2.3.4.5.6.7.8.{}", uid_suffix))
+                .implementation_class_uid("1.2.3.4")
+                .build()
+                .expect("valid file meta"),
+        );
+        put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+        put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
+        file_obj
+            .write_to_file(dir.join(name))
+            .expect("write DICOM file");
+    }
+
+    let recipe_path = tmp.path().join("recipe.txt");
+    fs::write(
+        &recipe_path,
+        "FORMAT dicom\n%header\nREPLACE PatientName ANON\n",
+    )
+    .expect("write recipe");
+
+    let config = DeidConfig {
+        input_dir: input_dir.clone(),
+        output_dir: output_dir.clone(),
+        recipe_path,
+        variables: HashMap::new(),
+        functions: HashMap::new(),
+    };
+
+    let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+    let report = pipeline.run().expect("should run pipeline");
+
+    assert_eq!(report.files_processed, 3, "all 3 files should be processed");
+
+    // Verify directory structure is preserved (r-1-4)
+    assert!(
+        output_dir.join("root.dcm").exists(),
+        "root-level file should exist"
+    );
+    assert!(
+        output_dir.join("sub1").join("level1.dcm").exists(),
+        "sub1-level file should exist"
+    );
+    assert!(
+        output_dir
+            .join("sub1")
+            .join("sub2")
+            .join("level2.dcm")
+            .exists(),
+        "sub2-level file should exist"
+    );
+
+    // Verify all files were de-identified
+    for path in [
+        output_dir.join("root.dcm"),
+        output_dir.join("sub1").join("level1.dcm"),
+        output_dir.join("sub1").join("sub2").join("level2.dcm"),
+    ] {
+        let result = open_file(&path).expect("should open output");
+        let name = result
+            .element_by_name("PatientName")
+            .expect("should have PatientName");
+        let val = name.value().to_str().expect("should read value");
+        assert_eq!(
+            val.as_ref(),
+            "ANON",
+            "PatientName should be replaced in {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn pipeline_graylist_pixel_masking() {
+    let tmp = TempDir::new().expect("should create temp dir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+
+    // Create a DICOM file with pixel data
+    let mut file_obj = create_test_file_obj();
+    put_str(&mut file_obj, tags::MANUFACTURER, VR::LO, "GE MEDICAL");
+    put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
+    put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+
+    // Set pixel data attributes: 4x4 monochrome image, 8-bit
+    file_obj.put(DataElement::new(
+        tags::ROWS,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(4u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::COLUMNS,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(4u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::BITS_ALLOCATED,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(8u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::BITS_STORED,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(8u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::HIGH_BIT,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(7u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::PIXEL_REPRESENTATION,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(0u16)),
+    ));
+    file_obj.put(DataElement::new(
+        tags::SAMPLES_PER_PIXEL,
+        VR::US,
+        Value::Primitive(PrimitiveValue::from(1u16)),
+    ));
+    put_str(
+        &mut file_obj,
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        "MONOCHROME2",
+    );
+
+    // 4x4 = 16 bytes of pixel data, all 0xFF
+    let pixel_data: Vec<u8> = vec![0xFF; 16];
+    file_obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        VR::OW,
+        Value::Primitive(PrimitiveValue::from(pixel_data)),
+    ));
+
+    let dcm_path = input_dir.join("ge_ct.dcm");
+    file_obj.write_to_file(&dcm_path).expect("write DICOM file");
+
+    // Recipe with graylist for GE that masks the top 2 rows (0,0 to 4,2)
+    let recipe_path = tmp.path().join("recipe.txt");
+    fs::write(
+        &recipe_path,
+        "\
+FORMAT dicom
+
+%filter graylist
+
+LABEL GE CT
+contains Manufacturer GE
+coordinates 0,0,4,2
+
+%header
+
+REPLACE PatientName ANON
+",
+    )
+    .expect("write recipe");
+
+    let config = DeidConfig {
+        input_dir: input_dir.clone(),
+        output_dir: output_dir.clone(),
+        recipe_path,
+        variables: HashMap::new(),
+        functions: HashMap::new(),
+    };
+
+    let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+    let report = pipeline.run().expect("should run pipeline");
+
+    assert_eq!(report.files_processed, 1);
+
+    let output_file = output_dir.join("ge_ct.dcm");
+    assert!(output_file.exists(), "output file should exist");
+
+    // Read back and check pixel data has masked region
+    let result = open_file(&output_file).expect("should open output");
+
+    let pixel_elem = result
+        .element(tags::PIXEL_DATA)
+        .expect("should have pixels");
+    let pixel_bytes = pixel_elem
+        .value()
+        .to_bytes()
+        .expect("should read pixel bytes");
+
+    // Top 2 rows (8 bytes) should be masked (0x00), bottom 2 rows should remain 0xFF
+    for (i, byte) in pixel_bytes.iter().enumerate() {
+        if i < 8 {
+            assert_eq!(*byte, 0x00, "pixel byte {} in masked region should be 0", i);
+        } else {
+            assert_eq!(
+                *byte, 0xFF,
+                "pixel byte {} outside masked region should be unchanged",
+                i
+            );
+        }
+    }
+
+    // Also verify metadata was de-identified
+    let name = result
+        .element_by_name("PatientName")
+        .expect("should have PatientName");
+    let val = name.value().to_str().expect("should read value");
+    assert_eq!(val.as_ref(), "ANON");
+}
