@@ -72,9 +72,11 @@ pub fn apply_header_actions(
                 let days: i64 = days_str
                     .parse()
                     .map_err(|_| DeidError::Dicom(format!("invalid jitter value: {}", days_str)))?;
-                let current = obj
-                    .element(*tag)
-                    .map_err(|e| DeidError::Dicom(format!("tag not found for jitter: {}", e)))?
+                let elem = match obj.element(*tag) {
+                    Ok(e) => e,
+                    Err(_) => continue, // tag absent — nothing to jitter
+                };
+                let current = elem
                     .value()
                     .to_str()
                     .map_err(|e| DeidError::Dicom(format!("cannot read date for jitter: {}", e)))?;
@@ -114,6 +116,37 @@ pub fn apply_header_actions(
         }
     }
 
+    // Recurse into sequence elements
+    let seq_tags: Vec<Tag> = obj
+        .iter()
+        .filter(|e| e.value().items().is_some())
+        .map(|e| e.header().tag())
+        .collect();
+
+    for seq_tag in seq_tags {
+        let mut elem = match obj.take_element(seq_tag) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let mut seq_error: Option<DeidError> = None;
+        elem.update_value(|val| {
+            if let Some(items) = val.items_mut() {
+                for item in items.iter_mut() {
+                    if seq_error.is_some() {
+                        break;
+                    }
+                    if let Err(e) = apply_header_actions(actions, variables, functions, item) {
+                        seq_error = Some(e);
+                    }
+                }
+            }
+        });
+        obj.put(elem);
+        if let Some(e) = seq_error {
+            return Err(e);
+        }
+    }
+
     Ok(())
 }
 
@@ -126,6 +159,28 @@ pub fn remove_private_tags(obj: &mut InMemDicomObject) {
         .collect();
     for tag in private_tags {
         let _ = obj.remove_element(tag);
+    }
+
+    // Recurse into sequence elements
+    let seq_tags: Vec<Tag> = obj
+        .iter()
+        .filter(|e| e.value().items().is_some())
+        .map(|e| e.header().tag())
+        .collect();
+
+    for seq_tag in seq_tags {
+        let mut elem = match obj.take_element(seq_tag) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        elem.update_value(|val| {
+            if let Some(items) = val.items_mut() {
+                for item in items.iter_mut() {
+                    remove_private_tags(item);
+                }
+            }
+        });
+        obj.put(elem);
     }
 }
 
@@ -1626,6 +1681,230 @@ mod tests {
             val.as_ref(),
             "20230102",
             "JITTER should work on private tags"
+        );
+    }
+
+    // -- r-3-13 Nested sequence support --------------------------------------
+
+    /// ReferencedSeriesSequence tag used as the sequence container in tests.
+    const SEQ_TAG: Tag = Tag(0x0008, 0x1115);
+
+    /// Requirement r-3-13: REPLACE modifies a field within a sequence item.
+    #[test]
+    fn r3_13_replace_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-ORIGINAL");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Replace,
+            tag: TagSpecifier::Keyword("AccessionNumber".into()),
+            value: Some(ActionValue::Literal("ACC-REPLACED".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        let val = seq_items[0]
+            .element(tags::ACCESSION_NUMBER)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "ACC-REPLACED");
+    }
+
+    /// Requirement r-3-13: REMOVE deletes a field from a sequence item while leaving others.
+    #[test]
+    fn r3_13_remove_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-123");
+        put_str(&mut item, tags::MODALITY, VR::CS, "CT");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Remove,
+            tag: TagSpecifier::Keyword("AccessionNumber".into()),
+            value: None,
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        assert!(
+            seq_items[0].element(tags::ACCESSION_NUMBER).is_err(),
+            "AccessionNumber should be removed from sequence item"
+        );
+        assert!(
+            seq_items[0].element(tags::MODALITY).is_ok(),
+            "Modality should remain in sequence item"
+        );
+    }
+
+    /// Requirement r-3-13: BLANK empties a field inside a sequence item.
+    #[test]
+    fn r3_13_blank_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-123");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Blank,
+            tag: TagSpecifier::Keyword("AccessionNumber".into()),
+            value: None,
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        let val = seq_items[0]
+            .element(tags::ACCESSION_NUMBER)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "",
+            "blanked tag inside sequence should be empty"
+        );
+    }
+
+    /// Requirement r-3-13: JITTER shifts a date inside a sequence item.
+    #[test]
+    fn r3_13_jitter_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::STUDY_DATE, VR::DA, "20200115");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Jitter,
+            tag: TagSpecifier::Keyword("StudyDate".into()),
+            value: Some(ActionValue::Literal("5".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        let val = seq_items[0]
+            .element(tags::STUDY_DATE)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "20200120");
+    }
+
+    /// Requirement r-3-13: REPLACE reaches elements inside a sequence-within-a-sequence.
+    #[test]
+    fn r3_13_nested_sequence_two_levels_deep() {
+        let mut inner_item = create_test_obj();
+        put_str(&mut inner_item, tags::ACCESSION_NUMBER, VR::SH, "DEEP-ACC");
+
+        let mut outer_item = create_test_obj();
+        put_sequence(&mut outer_item, SEQ_TAG, vec![inner_item]);
+
+        let mut obj = create_test_obj();
+        // Use a different sequence tag for the outer level
+        let outer_seq_tag = Tag(0x0008, 0x1200); // StudiesContainingOtherReferencedInstancesSequence
+        put_sequence(&mut obj, outer_seq_tag, vec![outer_item]);
+
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Replace,
+            tag: TagSpecifier::Keyword("AccessionNumber".into()),
+            value: Some(ActionValue::Literal("REPLACED-DEEP".into())),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let outer_items = obj.element(outer_seq_tag).unwrap().items().unwrap();
+        let inner_items = outer_items[0].element(SEQ_TAG).unwrap().items().unwrap();
+        let val = inner_items[0]
+            .element(tags::ACCESSION_NUMBER)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(val.as_ref(), "REPLACED-DEEP");
+    }
+
+    /// Requirement r-3-13: KEEP overrides REMOVE for fields inside sequences.
+    #[test]
+    fn r3_13_keep_protects_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-KEEP");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        let actions = vec![
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: None,
+            },
+            HeaderAction {
+                action_type: ActionType::Keep,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: None,
+            },
+        ];
+
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        let val = seq_items[0]
+            .element(tags::ACCESSION_NUMBER)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            val.as_ref(),
+            "ACC-KEEP",
+            "KEEP should protect field inside sequence"
+        );
+    }
+
+    /// Requirement r-3-13: remove_private_tags removes private tags from within sequences.
+    #[test]
+    fn r3_13_remove_private_tags_inside_sequence() {
+        let mut item = create_test_obj();
+        put_str(&mut item, tags::MODALITY, VR::CS, "CT");
+        put_str(&mut item, Tag(0x0009, 0x0010), VR::LO, "PRIVATE CREATOR");
+        put_str(&mut item, Tag(0x0009, 0x1001), VR::LO, "private data");
+
+        let mut obj = create_test_obj();
+        put_sequence(&mut obj, SEQ_TAG, vec![item]);
+
+        remove_private_tags(&mut obj);
+
+        let seq_items = obj.element(SEQ_TAG).unwrap().items().unwrap();
+        assert!(
+            seq_items[0].element(tags::MODALITY).is_ok(),
+            "standard tag should remain inside sequence"
+        );
+        assert!(
+            seq_items[0].element(Tag(0x0009, 0x0010)).is_err(),
+            "private creator should be removed from sequence"
+        );
+        assert!(
+            seq_items[0].element(Tag(0x0009, 0x1001)).is_err(),
+            "private data should be removed from sequence"
         );
     }
 }

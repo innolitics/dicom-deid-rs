@@ -53,6 +53,7 @@ r-3-9 The software must support blanking a DICOM tag (setting its value to empty
 r-3-10 The software must support explicitly keeping a tag's original value unchanged, protecting it from removal by broader rules
 r-3-11 When multiple actions apply to the same field, the software must respect a precedence hierarchy: KEEP > ADD > REPLACE > JITTER > REMOVE > BLANK
 r-3-12 The software must support bulk removal of private tags from DICOM files
+r-3-13 All metadata de-identification actions (ADD, REPLACE, REMOVE, BLANK, KEEP, JITTER) and private tag removal must apply recursively to elements nested within DICOM sequences (VR=SQ) at any depth.
 
 r-4 Pixel-based De-identification
 r-4-1 The software must support pixel-based de-identification by masking over pixel areas

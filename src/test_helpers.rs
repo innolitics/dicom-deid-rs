@@ -1,5 +1,5 @@
-use dicom_core::value::{PrimitiveValue, Value};
-use dicom_core::{DataElement, Tag, VR};
+use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
+use dicom_core::{DataElement, Length, Tag, VR};
 use dicom_object::meta::FileMetaTableBuilder;
 use dicom_object::{FileDicomObject, InMemDicomObject};
 
@@ -23,6 +23,15 @@ pub fn put_empty(obj: &mut InMemDicomObject, tag: Tag, vr: VR) {
         tag,
         vr,
         Value::Primitive(PrimitiveValue::Empty),
+    ));
+}
+
+/// Insert a sequence element into a DICOM object.
+pub fn put_sequence(obj: &mut InMemDicomObject, tag: Tag, items: Vec<InMemDicomObject>) {
+    obj.put(DataElement::new(
+        tag,
+        VR::SQ,
+        Value::from(DataSetSequence::new(items, Length::UNDEFINED)),
     ));
 }
 
