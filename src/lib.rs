@@ -1,5 +1,6 @@
 pub mod error;
 pub mod filter;
+pub mod functions;
 pub mod metadata;
 pub mod pipeline;
 pub mod pixel;

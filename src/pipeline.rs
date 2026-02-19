@@ -1,5 +1,6 @@
 use crate::error::DeidError;
 use crate::filter;
+use crate::functions;
 use crate::metadata;
 use crate::metadata::DeidFunction;
 use crate::pixel;
@@ -39,9 +40,19 @@ enum FileOutcome {
 
 impl DeidPipeline {
     /// Create a new pipeline, parsing the recipe from the configured path.
-    pub fn new(config: DeidConfig) -> Result<Self, DeidError> {
+    ///
+    /// Built-in functions (e.g. `hashuid`) are registered automatically.
+    /// User-supplied functions in `config.functions` take precedence over
+    /// built-in functions with the same name.
+    pub fn new(mut config: DeidConfig) -> Result<Self, DeidError> {
         let recipe_text = fs::read_to_string(&config.recipe_path)?;
         let recipe = Recipe::parse(&recipe_text)?;
+        // Merge built-in functions; user-supplied functions override defaults.
+        let mut merged = functions::default_functions();
+        for (name, func) in config.functions.drain() {
+            merged.insert(name, func);
+        }
+        config.functions = merged;
         Ok(DeidPipeline { config, recipe })
     }
 
