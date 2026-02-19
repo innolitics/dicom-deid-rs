@@ -123,3 +123,110 @@ fn r4_7_mask_without_decompress_returns_error() {
         err_msg
     );
 }
+
+// =========================================================================
+// JPEG 2000 Lossless (1.2.840.10008.1.2.4.90) — requires jpeg2000 feature
+// =========================================================================
+
+/// Requirement r-4-7: decompress JPEG 2000 Lossless compressed pixel data
+#[cfg(feature = "jpeg2000")]
+#[test]
+fn r4_7_decompress_j2k_lossless() {
+    let mut obj =
+        open_file("tests/fixtures/j2k_lossless_8x8.dcm").expect("should open J2K fixture");
+
+    // Before decompression, pixel data should be encapsulated
+    let elem = obj.element(tags::PIXEL_DATA).unwrap();
+    assert!(
+        matches!(elem.value(), Value::PixelSequence { .. }),
+        "fixture should have encapsulated pixel data"
+    );
+
+    // Transfer syntax should be JPEG 2000 Lossless
+    assert_eq!(
+        obj.meta().transfer_syntax(),
+        "1.2.840.10008.1.2.4.90",
+        "fixture should use JPEG 2000 Lossless transfer syntax"
+    );
+
+    decompress_pixel_data(&mut obj).expect("J2K decompression should succeed");
+
+    // After decompression, pixel data should be primitive
+    let elem = obj.element(tags::PIXEL_DATA).unwrap();
+    assert!(
+        matches!(elem.value(), Value::Primitive(_)),
+        "decompressed pixel data should be primitive"
+    );
+
+    // Transfer syntax should be updated to Explicit VR Little Endian (r-4-8)
+    assert_eq!(
+        obj.meta().transfer_syntax(),
+        "1.2.840.10008.1.2.1",
+        "transfer syntax should be updated to Explicit VR Little Endian"
+    );
+
+    // Pixel data should have the right size for an 8x8 image
+    let bytes = elem.value().to_bytes().expect("should read pixel bytes");
+    assert!(
+        bytes.len() >= 64,
+        "8x8 image should have at least 64 bytes, got {}",
+        bytes.len()
+    );
+    // All pixels should be 255 (white) — lossless compression
+    let white_count = bytes[..64].iter().filter(|&&b| b == 255).count();
+    assert_eq!(
+        white_count, 64,
+        "all 64 pixels should be 255 (white) after lossless decompression, got {}/64",
+        white_count
+    );
+}
+
+/// Requirement r-4-7 + r-4-8: decompress JPEG 2000 Lossless then apply pixel mask
+#[cfg(feature = "jpeg2000")]
+#[test]
+fn r4_7_decompress_and_mask_j2k_lossless() {
+    let mut obj =
+        open_file("tests/fixtures/j2k_lossless_8x8.dcm").expect("should open J2K fixture");
+
+    decompress_pixel_data(&mut obj).expect("J2K decompression should succeed");
+
+    // Mask the top-left 4x4 region
+    let regions = vec![CoordinateRegion {
+        xmin: 0,
+        ymin: 0,
+        xmax: 4,
+        ymax: 4,
+        keep: false,
+    }];
+
+    apply_pixel_mask(&mut obj, &regions).expect("masking should succeed");
+
+    let elem = obj.element(tags::PIXEL_DATA).unwrap();
+    let bytes = elem.value().to_bytes().expect("should read pixel bytes");
+
+    // Top-left 4x4 should be zeroed
+    for row in 0..4 {
+        for col in 0..4 {
+            assert_eq!(
+                bytes[row * 8 + col],
+                0,
+                "masked pixel ({},{}) should be 0",
+                col,
+                row
+            );
+        }
+    }
+
+    // Bottom-right should remain 255
+    for row in 4..8 {
+        for col in 4..8 {
+            assert_eq!(
+                bytes[row * 8 + col],
+                255,
+                "unmasked pixel ({},{}) should be 255",
+                col,
+                row
+            );
+        }
+    }
+}
