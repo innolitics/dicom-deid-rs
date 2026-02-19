@@ -471,3 +471,214 @@ REPLACE PatientName ANON
     let val = name.value().to_str().expect("should read value");
     assert_eq!(val.as_ref(), "ANON");
 }
+
+// ============================================================================
+// Category 6: Test Recipe File Parsing & Application
+// ============================================================================
+// Verifies that resources/test_recipe.txt parses and that its header actions
+// apply correctly to a representative DICOM object.
+
+#[test]
+fn test_recipe_parses_and_applies() {
+    let recipe_text =
+        fs::read_to_string("resources/test_recipe.txt").expect("should read test recipe file");
+    let recipe = Recipe::parse(&recipe_text).expect("test recipe should parse");
+
+    // Verify structure
+    assert_eq!(recipe.format, "dicom");
+    assert_eq!(
+        recipe.filters.len(),
+        2,
+        "should have graylist and blacklist"
+    );
+
+    let graylist = &recipe.filters[0];
+    assert_eq!(graylist.labels.len(), 8, "graylist should have 8 labels");
+
+    let blacklist = &recipe.filters[1];
+    assert_eq!(blacklist.labels.len(), 3, "blacklist should have 3 labels");
+
+    assert!(
+        !recipe.header.is_empty(),
+        "header should have at least one action"
+    );
+
+    // Build a representative DICOM object
+    let mut obj = create_test_obj();
+    put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+    put_str(&mut obj, tags::PATIENT_ID, VR::LO, "MRN-12345");
+    put_str(&mut obj, tags::PATIENT_SEX, VR::CS, "M");
+    put_str(&mut obj, tags::PATIENT_BIRTH_DATE, VR::DA, "19800101");
+    put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20230615");
+    put_str(&mut obj, tags::SERIES_DATE, VR::DA, "20230615");
+    put_str(&mut obj, tags::STUDY_DESCRIPTION, VR::LO, "CT ABDOMEN");
+    put_str(&mut obj, tags::INSTITUTION_NAME, VR::LO, "General Hospital");
+    put_str(
+        &mut obj,
+        tags::INSTITUTION_ADDRESS,
+        VR::ST,
+        "123 Medical Dr",
+    );
+    put_str(&mut obj, tags::STATION_NAME, VR::SH, "CT-SCANNER-01");
+    put_str(&mut obj, tags::MANUFACTURER, VR::LO, "GE MEDICAL");
+    put_str(&mut obj, tags::MODALITY, VR::CS, "CT");
+    put_str(
+        &mut obj,
+        tags::REFERRING_PHYSICIAN_NAME,
+        VR::PN,
+        "Dr. Smith",
+    );
+    put_str(
+        &mut obj,
+        tags::PERFORMING_PHYSICIAN_NAME,
+        VR::PN,
+        "Dr. Jones",
+    );
+    put_str(&mut obj, tags::OPERATORS_NAME, VR::PN, "Tech One");
+    put_str(&mut obj, tags::IMAGE_COMMENTS, VR::LT, "Some comment");
+    put_str(&mut obj, tags::PATIENT_ADDRESS, VR::LO, "456 Patient St");
+    put_str(&mut obj, tags::OCCUPATION, VR::SH, "Engineer");
+
+    // Provide required variables and a stub hashuid function
+    let mut vars = HashMap::new();
+    vars.insert("PATIENT_ID".into(), "ANON-001".into());
+    vars.insert("PATIENT_NAME".into(), "ANONYMOUS".into());
+    vars.insert("DATEINC".into(), "5".into());
+
+    let mut funcs: HashMap<String, DeidFunction> = HashMap::new();
+    funcs.insert(
+        "hashuid".into(),
+        Box::new(|input: &str| Ok(format!("hashed-{}", input))),
+    );
+    funcs.insert(
+        "hash_accession".into(),
+        Box::new(|input: &str| Ok(format!("acc-{}", input))),
+    );
+
+    apply_header_actions(&recipe.header, &vars, &funcs, &mut obj)
+        .expect("applying test recipe header actions should succeed");
+
+    // --- Verify KEEP actions preserved tags ----------------------------------
+    let modality = obj
+        .element(tags::MODALITY)
+        .expect("Modality should be kept")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(modality.as_ref(), "CT");
+
+    let manufacturer = obj
+        .element(tags::MANUFACTURER)
+        .expect("Manufacturer should be kept")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(manufacturer.as_ref(), "GE MEDICAL");
+
+    let sex = obj
+        .element(tags::PATIENT_SEX)
+        .expect("PatientSex should be kept")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(sex.as_ref(), "M");
+
+    // --- Verify REPLACE with var: -------------------------------------------
+    let pid = obj
+        .element(tags::PATIENT_ID)
+        .expect("PatientID should be present")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(pid.as_ref(), "ANON-001");
+
+    let pname = obj
+        .element(tags::PATIENT_NAME)
+        .expect("PatientName should be present")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(pname.as_ref(), "ANONYMOUS");
+
+    // --- Verify REPLACE with literal ----------------------------------------
+    let study_id = obj
+        .element_by_name("StudyID")
+        .expect("StudyID should be present")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(study_id.as_ref(), "ANONYMIZED");
+
+    // --- Verify JITTER shifted dates ----------------------------------------
+    let study_date = obj
+        .element(tags::STUDY_DATE)
+        .expect("StudyDate should be present")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        study_date.as_ref(),
+        "20230620",
+        "StudyDate should be jittered +5 days"
+    );
+
+    // --- Verify BLANK actions -----------------------------------------------
+    let birth_date = obj
+        .element(tags::PATIENT_BIRTH_DATE)
+        .expect("PatientBirthDate should be present but blanked")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(birth_date.as_ref(), "");
+
+    let ref_phys = obj
+        .element(tags::REFERRING_PHYSICIAN_NAME)
+        .expect("ReferringPhysicianName should be present but blanked")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(ref_phys.as_ref(), "");
+
+    // --- Verify REMOVE actions ----------------------------------------------
+    assert!(
+        obj.element(tags::INSTITUTION_NAME).is_err(),
+        "InstitutionName should be removed"
+    );
+    assert!(
+        obj.element(tags::INSTITUTION_ADDRESS).is_err(),
+        "InstitutionAddress should be removed"
+    );
+    assert!(
+        obj.element(tags::STATION_NAME).is_err(),
+        "StationName should be removed"
+    );
+    assert!(
+        obj.element(tags::STUDY_DESCRIPTION).is_err(),
+        "StudyDescription should be removed"
+    );
+    assert!(
+        obj.element(tags::PERFORMING_PHYSICIAN_NAME).is_err(),
+        "PerformingPhysicianName should be removed"
+    );
+    assert!(
+        obj.element(tags::OPERATORS_NAME).is_err(),
+        "OperatorName should be removed"
+    );
+    assert!(
+        obj.element(tags::IMAGE_COMMENTS).is_err(),
+        "ImageComments should be removed"
+    );
+    assert!(
+        obj.element(tags::PATIENT_ADDRESS).is_err(),
+        "PatientAddress should be removed"
+    );
+
+    // --- Verify ADD actions -------------------------------------------------
+    let identity_removed = obj
+        .element_by_name("PatientIdentityRemoved")
+        .expect("PatientIdentityRemoved should be added")
+        .value()
+        .to_str()
+        .unwrap();
+    assert_eq!(identity_removed.as_ref(), "YES");
+}
