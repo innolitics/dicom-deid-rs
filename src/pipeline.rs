@@ -1,7 +1,13 @@
 use crate::error::DeidError;
+use crate::filter;
+use crate::metadata;
 use crate::metadata::DeidFunction;
+use crate::pixel;
 use crate::recipe::Recipe;
+use dicom_object::open_file;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Configuration for the de-identification pipeline.
@@ -26,21 +32,116 @@ pub struct DeidPipeline {
     pub recipe: Recipe,
 }
 
+enum FileOutcome {
+    Processed,
+    Blacklisted,
+}
+
 impl DeidPipeline {
     /// Create a new pipeline, parsing the recipe from the configured path.
     pub fn new(config: DeidConfig) -> Result<Self, DeidError> {
-        todo!()
+        let recipe_text = fs::read_to_string(&config.recipe_path)?;
+        let recipe = Recipe::parse(&recipe_text)?;
+        Ok(DeidPipeline { config, recipe })
     }
 
     /// Recursively search a directory for DICOM files.
     pub fn find_dicom_files(dir: &Path) -> Result<Vec<PathBuf>, DeidError> {
-        todo!()
+        let mut results = Vec::new();
+        find_dicom_files_recursive(dir, &mut results)?;
+        Ok(results)
     }
 
     /// Run the de-identification pipeline.
     pub fn run(&self) -> Result<DeidReport, DeidError> {
-        todo!()
+        let files = Self::find_dicom_files(&self.config.input_dir)?;
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
+                .expect("valid progress bar template")
+                .progress_chars("=> "),
+        );
+
+        let mut report = DeidReport {
+            files_processed: 0,
+            files_skipped: 0,
+            files_blacklisted: 0,
+        };
+
+        for file_path in &files {
+            match self.process_file(file_path) {
+                Ok(FileOutcome::Processed) => report.files_processed += 1,
+                Ok(FileOutcome::Blacklisted) => report.files_blacklisted += 1,
+                Err(e) => {
+                    pb.println(format!("Warning: skipping {}: {}", file_path.display(), e));
+                    report.files_skipped += 1;
+                }
+            }
+            pb.inc(1);
+        }
+
+        pb.finish_with_message("De-identification complete");
+        Ok(report)
     }
+
+    fn process_file(&self, file_path: &Path) -> Result<FileOutcome, DeidError> {
+        let mut obj = open_file(file_path).map_err(|e| {
+            DeidError::Dicom(format!("failed to open {}: {}", file_path.display(), e))
+        })?;
+
+        // Check blacklist
+        if filter::is_blacklisted(&self.recipe, &obj) {
+            return Ok(FileOutcome::Blacklisted);
+        }
+
+        // Pixel de-identification
+        let regions = filter::get_graylist_regions(&self.recipe, &obj);
+        if !regions.is_empty() {
+            pixel::decompress_pixel_data(&mut obj)?;
+            pixel::apply_pixel_mask(&mut obj, &regions)?;
+        }
+
+        // Metadata de-identification
+        metadata::apply_header_actions(
+            &self.recipe.header,
+            &self.config.variables,
+            &self.config.functions,
+            &mut obj,
+        )?;
+        metadata::remove_private_tags(&mut obj);
+
+        // Compute output path preserving directory structure
+        let relative = file_path
+            .strip_prefix(&self.config.input_dir)
+            .map_err(|e| DeidError::Io(std::io::Error::other(e)))?;
+        let output_path = self.config.output_dir.join(relative);
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        obj.write_to_file(&output_path).map_err(|e| {
+            DeidError::Dicom(format!("failed to write {}: {}", output_path.display(), e))
+        })?;
+
+        Ok(FileOutcome::Processed)
+    }
+}
+
+fn find_dicom_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), DeidError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            find_dicom_files_recursive(&path, results)?;
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
+        {
+            results.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -96,6 +197,96 @@ mod tests {
         let tmp = TempDir::new().expect("should create temp dir");
         let files = DeidPipeline::find_dicom_files(tmp.path()).expect("should handle empty dir");
         assert!(files.is_empty());
+    }
+
+    /// Requirement r-1-2
+    #[test]
+    fn r1_2_find_skips_non_dcm_files() {
+        let tmp = TempDir::new().expect("should create temp dir");
+        let root = tmp.path();
+
+        fs::write(root.join("image.dcm"), b"DICM").expect("write");
+        fs::write(root.join("readme.txt"), b"text").expect("write");
+        fs::write(root.join("data.json"), b"{}").expect("write");
+        fs::write(root.join("report.pdf"), b"PDF").expect("write");
+
+        let files = DeidPipeline::find_dicom_files(root).expect("should find files");
+        assert_eq!(files.len(), 1, "should only find .dcm files");
+        assert!(
+            files[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(".dcm")
+        );
+    }
+
+    // -- r-1-3 ---------------------------------------------------------------
+
+    /// Requirement r-1-3: full pipeline run with a valid DICOM file
+    #[test]
+    fn r1_3_run_processes_dicom_file() {
+        use crate::test_helpers::*;
+
+        let tmp = TempDir::new().expect("should create temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        // Create a minimal valid DICOM file
+        let mut file_obj = create_test_file_obj();
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_NAME,
+            dicom_core::VR::PN,
+            "John^Doe",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::MODALITY,
+            dicom_core::VR::CS,
+            "CT",
+        );
+        let dcm_path = input_dir.join("test.dcm");
+        file_obj
+            .write_to_file(&dcm_path)
+            .expect("write test DICOM file");
+
+        // Create a minimal recipe file
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(
+            &recipe_path,
+            "FORMAT dicom\n%header\nREPLACE PatientName ANON\n",
+        )
+        .expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir: input_dir.clone(),
+            output_dir: output_dir.clone(),
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+        let report = pipeline.run().expect("should run pipeline");
+
+        assert_eq!(report.files_processed, 1);
+        assert_eq!(report.files_skipped, 0);
+        assert_eq!(report.files_blacklisted, 0);
+
+        // Verify output file exists
+        let output_file = output_dir.join("test.dcm");
+        assert!(output_file.exists(), "output file should exist");
+
+        // Verify the patient name was replaced
+        let result_obj = open_file(&output_file).expect("should open output");
+        let name = result_obj
+            .element_by_name("PatientName")
+            .expect("should have PatientName");
+        let val = name.value().to_str().expect("should read value");
+        assert_eq!(val.as_ref(), "ANON");
     }
 
     // -- r-6-1 ---------------------------------------------------------------
