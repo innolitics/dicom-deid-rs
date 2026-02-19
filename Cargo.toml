@@ -9,6 +9,7 @@ dicom-core = "0.8"
 dicom-dictionary-std = "0.8"
 regex = "1"
 thiserror = "2"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

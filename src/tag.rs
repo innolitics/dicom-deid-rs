@@ -1,16 +1,41 @@
 use crate::error::DeidError;
 use crate::recipe::TagSpecifier;
 use dicom_core::Tag;
+use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
+use dicom_core::header::Header;
+use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::InMemDicomObject;
+use regex::Regex;
 
 /// Parse a tag string in parenthesized format "(GGGG,EEEE)" into a `Tag`.
 pub fn parse_parenthesized_tag(s: &str) -> Result<Tag, DeidError> {
-    todo!()
+    let inner = s
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| DeidError::TagResolution(format!("expected parenthesized tag: {}", s)))?;
+    let (group_str, elem_str) = inner
+        .split_once(',')
+        .ok_or_else(|| DeidError::TagResolution(format!("expected comma in tag: {}", s)))?;
+    let group = u16::from_str_radix(group_str.trim(), 16)
+        .map_err(|_| DeidError::TagResolution(format!("invalid group: {}", group_str)))?;
+    let element = u16::from_str_radix(elem_str.trim(), 16)
+        .map_err(|_| DeidError::TagResolution(format!("invalid element: {}", elem_str)))?;
+    Ok(Tag(group, element))
 }
 
 /// Parse a tag string in bare hex format "GGGGEEEE" into a `Tag`.
 pub fn parse_bare_hex_tag(s: &str) -> Result<Tag, DeidError> {
-    todo!()
+    if s.len() != 8 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(DeidError::TagResolution(format!(
+            "invalid bare hex tag: {}",
+            s
+        )));
+    }
+    let group = u16::from_str_radix(&s[0..4], 16)
+        .map_err(|_| DeidError::TagResolution(format!("invalid group: {}", &s[0..4])))?;
+    let element = u16::from_str_radix(&s[4..8], 16)
+        .map_err(|_| DeidError::TagResolution(format!("invalid element: {}", &s[4..8])))?;
+    Ok(Tag(group, element))
 }
 
 /// Resolve a `TagSpecifier` into one or more concrete `Tag` values.
@@ -21,7 +46,57 @@ pub fn resolve_tags(
     specifier: &TagSpecifier,
     obj: &InMemDicomObject,
 ) -> Result<Vec<Tag>, DeidError> {
-    todo!()
+    let dict = StandardDataDictionary;
+    match specifier {
+        TagSpecifier::Keyword(name) => {
+            let entry = dict
+                .by_name(name)
+                .ok_or_else(|| DeidError::TagResolution(format!("unknown keyword: {}", name)))?;
+            Ok(vec![entry.tag()])
+        }
+        TagSpecifier::TagValue(tag) => Ok(vec![*tag]),
+        TagSpecifier::Pattern(pattern) => {
+            let re = Regex::new(pattern)
+                .map_err(|e| DeidError::TagResolution(format!("invalid regex: {}", e)))?;
+            let mut matched = Vec::new();
+            for elem in obj.iter() {
+                let tag = elem.tag();
+                let tag_str = format!("({:04x},{:04x})", tag.0, tag.1);
+                let keyword = dict
+                    .by_tag(tag)
+                    .map(|e| e.alias().to_string())
+                    .unwrap_or_default();
+                if re.is_match(&keyword) || re.is_match(&tag_str) {
+                    matched.push(tag);
+                }
+            }
+            Ok(matched)
+        }
+        TagSpecifier::PrivateTag {
+            group,
+            creator,
+            element_offset,
+        } => {
+            for elem in obj.iter() {
+                let tag = elem.tag();
+                if tag.0 == *group
+                    && (0x0010..=0x00FF).contains(&tag.1)
+                    && elem
+                        .value()
+                        .to_str()
+                        .is_ok_and(|val| val.trim() == creator.as_str())
+                {
+                    let slot = tag.1;
+                    let resolved = Tag(*group, (slot << 8) | (*element_offset as u16));
+                    return Ok(vec![resolved]);
+                }
+            }
+            Err(DeidError::TagResolution(format!(
+                "private creator '{}' not found in group {:04x}",
+                creator, group
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

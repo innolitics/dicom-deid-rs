@@ -1,6 +1,12 @@
 use crate::error::DeidError;
-use crate::recipe::{ActionType, ActionValue, HeaderAction, TagSpecifier};
-use dicom_core::Tag;
+use crate::recipe::{ActionType, ActionValue, HeaderAction};
+use crate::tag::resolve_tags;
+use chrono::NaiveDate;
+use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
+use dicom_core::header::Header;
+use dicom_core::value::{PrimitiveValue, Value};
+use dicom_core::{DataElement, Tag, VR};
+use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::InMemDicomObject;
 use std::collections::HashMap;
 
@@ -19,12 +25,97 @@ pub fn apply_header_actions(
     functions: &HashMap<String, DeidFunction>,
     obj: &mut InMemDicomObject,
 ) -> Result<(), DeidError> {
-    todo!()
+    // Build winning-action map based on precedence
+    let mut winning: HashMap<Tag, &HeaderAction> = HashMap::new();
+    for action in actions {
+        let tags = resolve_tags(&action.tag, obj)?;
+        for tag in tags {
+            let should_replace = match winning.get(&tag) {
+                Some(existing) => {
+                    action_precedence(&action.action_type)
+                        < action_precedence(&existing.action_type)
+                }
+                None => true,
+            };
+            if should_replace {
+                winning.insert(tag, action);
+            }
+        }
+    }
+
+    // Apply each winning action
+    for (tag, action) in &winning {
+        match action.action_type {
+            ActionType::Keep => { /* no-op */ }
+            ActionType::Add => {
+                if obj.element(*tag).is_err() {
+                    let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                    let vr = lookup_vr(obj, *tag);
+                    obj.put(DataElement::new(
+                        *tag,
+                        vr,
+                        Value::Primitive(PrimitiveValue::from(value.as_str())),
+                    ));
+                }
+            }
+            ActionType::Replace => {
+                let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                let vr = lookup_vr(obj, *tag);
+                obj.put(DataElement::new(
+                    *tag,
+                    vr,
+                    Value::Primitive(PrimitiveValue::from(value.as_str())),
+                ));
+            }
+            ActionType::Jitter => {
+                let days_str = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                let days: i64 = days_str
+                    .parse()
+                    .map_err(|_| DeidError::Dicom(format!("invalid jitter value: {}", days_str)))?;
+                let current = obj
+                    .element(*tag)
+                    .map_err(|e| DeidError::Dicom(format!("tag not found for jitter: {}", e)))?
+                    .value()
+                    .to_str()
+                    .map_err(|e| DeidError::Dicom(format!("cannot read date for jitter: {}", e)))?;
+                let date = NaiveDate::parse_from_str(current.trim(), "%Y%m%d")
+                    .map_err(|e| DeidError::Dicom(format!("invalid date for jitter: {}", e)))?;
+                let shifted = date + chrono::Duration::days(days);
+                let vr = lookup_vr(obj, *tag);
+                let formatted = shifted.format("%Y%m%d").to_string();
+                obj.put(DataElement::new(
+                    *tag,
+                    vr,
+                    Value::Primitive(PrimitiveValue::from(formatted.as_str())),
+                ));
+            }
+            ActionType::Remove => {
+                let _ = obj.remove_element(*tag);
+            }
+            ActionType::Blank => {
+                let vr = lookup_vr(obj, *tag);
+                obj.put(DataElement::new(
+                    *tag,
+                    vr,
+                    Value::Primitive(PrimitiveValue::from("")),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Remove all private tags (tags with odd group numbers) from a DICOM object.
 pub fn remove_private_tags(obj: &mut InMemDicomObject) {
-    todo!()
+    let private_tags: Vec<Tag> = obj
+        .iter()
+        .filter(|e| e.tag().group() % 2 != 0)
+        .map(|e| e.tag())
+        .collect();
+    for tag in private_tags {
+        let _ = obj.remove_element(tag);
+    }
 }
 
 /// Return the precedence rank of an action type.
@@ -40,6 +131,46 @@ pub fn action_precedence(action: &ActionType) -> u8 {
         ActionType::Remove => 4,
         ActionType::Blank => 5,
     }
+}
+
+fn resolve_value(
+    value: &Option<ActionValue>,
+    variables: &HashMap<String, String>,
+    functions: &HashMap<String, DeidFunction>,
+    obj: &InMemDicomObject,
+    tag: Tag,
+) -> Result<String, DeidError> {
+    match value {
+        Some(ActionValue::Literal(s)) => Ok(s.clone()),
+        Some(ActionValue::Variable(name)) => variables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| DeidError::VariableNotFound(name.clone())),
+        Some(ActionValue::Function { name }) => {
+            let func = functions
+                .get(name)
+                .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
+            let current = obj
+                .element(tag)
+                .ok()
+                .and_then(|e| e.value().to_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            func(&current)
+        }
+        None => Ok(String::new()),
+    }
+}
+
+fn lookup_vr(obj: &InMemDicomObject, tag: Tag) -> VR {
+    if let Ok(elem) = obj.element(tag) {
+        return elem.header().vr();
+    }
+    let dict = StandardDataDictionary;
+    if let Some(entry) = dict.by_tag(tag) {
+        return entry.vr().relaxed();
+    }
+    VR::LO
 }
 
 #[cfg(test)]
