@@ -682,3 +682,151 @@ fn test_recipe_parses_and_applies() {
         .unwrap();
     assert_eq!(identity_removed.as_ref(), "YES");
 }
+
+#[test]
+fn pipeline_blacklist_writes_report_file() {
+    let tmp = TempDir::new().expect("should create temp dir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+
+    // CT file — should pass through
+    let mut ct_file = create_test_file_obj();
+    put_str(&mut ct_file, tags::MODALITY, VR::CS, "CT");
+    ct_file
+        .write_to_file(input_dir.join("ct.dcm"))
+        .expect("write CT file");
+
+    // SR file — should be blacklisted by "Reject SR" label
+    let mut sr_file = FileDicomObject::new_empty_with_meta(
+        FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.88.11")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.10")
+            .implementation_class_uid("1.2.3.4")
+            .build()
+            .expect("valid file meta"),
+    );
+    put_str(&mut sr_file, tags::MODALITY, VR::CS, "SR");
+    sr_file
+        .write_to_file(input_dir.join("sr.dcm"))
+        .expect("write SR file");
+
+    // OT file — should also be blacklisted by "Reject OT" label
+    let mut ot_file = FileDicomObject::new_empty_with_meta(
+        FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.7")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.11")
+            .implementation_class_uid("1.2.3.4")
+            .build()
+            .expect("valid file meta"),
+    );
+    put_str(&mut ot_file, tags::MODALITY, VR::CS, "OT");
+    ot_file
+        .write_to_file(input_dir.join("ot.dcm"))
+        .expect("write OT file");
+
+    let recipe_path = tmp.path().join("recipe.txt");
+    fs::write(
+        &recipe_path,
+        "\
+FORMAT dicom
+
+%filter blacklist
+
+LABEL Reject SR
+equals Modality SR
+
+LABEL Reject OT
+equals Modality OT
+
+%header
+
+REPLACE PatientName ANON
+",
+    )
+    .expect("write recipe");
+
+    let config = DeidConfig {
+        input_dir: input_dir.clone(),
+        output_dir: output_dir.clone(),
+        recipe_path,
+        variables: HashMap::new(),
+        functions: HashMap::new(),
+    };
+
+    let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+    let report = pipeline.run().expect("should run pipeline");
+
+    assert_eq!(report.files_processed, 1);
+    assert_eq!(report.files_blacklisted, 2);
+
+    // Verify blacklist report file was written
+    let report_path = output_dir.join("blacklisted_files.txt");
+    assert!(report_path.exists(), "blacklisted_files.txt should exist");
+
+    let content = fs::read_to_string(&report_path).expect("read report");
+    let lines: Vec<&str> = content.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "should have 2 blacklisted entries");
+
+    // Each line should be "relative_path\tLabel Name"
+    for line in &lines {
+        assert!(
+            line.contains('\t'),
+            "line should be tab-separated: {}",
+            line
+        );
+    }
+
+    // Verify both files appear with correct reasons
+    let has_sr = lines
+        .iter()
+        .any(|l| l.contains("sr.dcm") && l.contains("Reject SR"));
+    let has_ot = lines
+        .iter()
+        .any(|l| l.contains("ot.dcm") && l.contains("Reject OT"));
+    assert!(has_sr, "report should list sr.dcm with reason 'Reject SR'");
+    assert!(has_ot, "report should list ot.dcm with reason 'Reject OT'");
+}
+
+#[test]
+fn pipeline_no_blacklist_no_report_file() {
+    let tmp = TempDir::new().expect("should create temp dir");
+    let input_dir = tmp.path().join("input");
+    let output_dir = tmp.path().join("output");
+    fs::create_dir_all(&input_dir).expect("create input dir");
+
+    let mut ct_file = create_test_file_obj();
+    put_str(&mut ct_file, tags::MODALITY, VR::CS, "CT");
+    ct_file
+        .write_to_file(input_dir.join("ct.dcm"))
+        .expect("write CT file");
+
+    let recipe_path = tmp.path().join("recipe.txt");
+    fs::write(
+        &recipe_path,
+        "FORMAT dicom\n%header\nREPLACE PatientName ANON\n",
+    )
+    .expect("write recipe");
+
+    let config = DeidConfig {
+        input_dir,
+        output_dir: output_dir.clone(),
+        recipe_path,
+        variables: HashMap::new(),
+        functions: HashMap::new(),
+    };
+
+    let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+    let report = pipeline.run().expect("should run pipeline");
+
+    assert_eq!(report.files_blacklisted, 0);
+
+    // No blacklist report should be created when no files are blacklisted
+    let report_path = output_dir.join("blacklisted_files.txt");
+    assert!(
+        !report_path.exists(),
+        "blacklisted_files.txt should NOT exist when no files are blacklisted"
+    );
+}

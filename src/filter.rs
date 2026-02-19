@@ -91,17 +91,23 @@ pub fn matches_label(label: &FilterLabel, obj: &InMemDicomObject) -> bool {
 /// Returns `true` if the object matches any label within any blacklist filter
 /// section, meaning it should be excluded from output.
 pub fn is_blacklisted(recipe: &Recipe, obj: &InMemDicomObject) -> bool {
+    blacklist_reason(recipe, obj).is_some()
+}
+
+/// Return the name of the first matching blacklist label, or `None` if no
+/// blacklist filter matches.
+pub fn blacklist_reason<'a>(recipe: &'a Recipe, obj: &InMemDicomObject) -> Option<&'a str> {
     for section in &recipe.filters {
         if section.filter_type != FilterType::Blacklist {
             continue;
         }
         for label in &section.labels {
             if matches_label(label, obj) {
-                return true;
+                return Some(&label.name);
             }
         }
     }
-    false
+    None
 }
 
 /// Collect all coordinate regions from graylist filters whose conditions match

@@ -35,7 +35,7 @@ pub struct DeidPipeline {
 
 enum FileOutcome {
     Processed,
-    Blacklisted,
+    Blacklisted(String),
 }
 
 impl DeidPipeline {
@@ -78,11 +78,18 @@ impl DeidPipeline {
             files_skipped: 0,
             files_blacklisted: 0,
         };
+        let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
 
         for file_path in &files {
             match self.process_file(file_path) {
                 Ok(FileOutcome::Processed) => report.files_processed += 1,
-                Ok(FileOutcome::Blacklisted) => report.files_blacklisted += 1,
+                Ok(FileOutcome::Blacklisted(reason)) => {
+                    let relative = file_path
+                        .strip_prefix(&self.config.input_dir)
+                        .unwrap_or(file_path);
+                    blacklisted_files.push((relative.to_path_buf(), reason));
+                    report.files_blacklisted += 1;
+                }
                 Err(e) => {
                     pb.println(format!("Warning: skipping {}: {}", file_path.display(), e));
                     report.files_skipped += 1;
@@ -92,6 +99,11 @@ impl DeidPipeline {
         }
 
         pb.finish_with_message("De-identification complete");
+
+        if !blacklisted_files.is_empty() {
+            self.write_blacklist_report(&blacklisted_files)?;
+        }
+
         Ok(report)
     }
 
@@ -101,8 +113,8 @@ impl DeidPipeline {
         })?;
 
         // Check blacklist
-        if filter::is_blacklisted(&self.recipe, &obj) {
-            return Ok(FileOutcome::Blacklisted);
+        if let Some(reason) = filter::blacklist_reason(&self.recipe, &obj) {
+            return Ok(FileOutcome::Blacklisted(reason.to_string()));
         }
 
         // Pixel de-identification
@@ -136,6 +148,17 @@ impl DeidPipeline {
         })?;
 
         Ok(FileOutcome::Processed)
+    }
+
+    fn write_blacklist_report(&self, blacklisted: &[(PathBuf, String)]) -> Result<(), DeidError> {
+        fs::create_dir_all(&self.config.output_dir)?;
+        let report_path = self.config.output_dir.join("blacklisted_files.txt");
+        let mut lines = Vec::with_capacity(blacklisted.len());
+        for (path, reason) in blacklisted {
+            lines.push(format!("{}\t{}", path.display(), reason));
+        }
+        fs::write(&report_path, lines.join("\n") + "\n")?;
+        Ok(())
     }
 }
 
