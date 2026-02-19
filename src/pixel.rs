@@ -1,6 +1,19 @@
 use crate::error::DeidError;
 use crate::recipe::CoordinateRegion;
+use dicom_core::DataElement;
+use dicom_core::value::{PrimitiveValue, Value};
+use dicom_dictionary_std::tags;
 use dicom_object::InMemDicomObject;
+
+/// Read a u16 value from a DICOM tag, returning an error if missing or invalid.
+fn read_u16_tag(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Result<u16, DeidError> {
+    let elem = obj
+        .element(tag)
+        .map_err(|_| DeidError::Dicom(format!("missing required tag {:?}", tag)))?;
+    elem.value()
+        .to_int::<u16>()
+        .map_err(|_| DeidError::Dicom(format!("cannot read tag {:?} as u16", tag)))
+}
 
 /// Apply pixel masking to a DICOM object.
 ///
@@ -11,7 +24,86 @@ pub fn apply_pixel_mask(
     obj: &mut InMemDicomObject,
     regions: &[CoordinateRegion],
 ) -> Result<(), DeidError> {
-    todo!()
+    if regions.is_empty() {
+        return Ok(());
+    }
+
+    let rows = read_u16_tag(obj, tags::ROWS)? as usize;
+    let cols = read_u16_tag(obj, tags::COLUMNS)? as usize;
+    let bits_allocated = read_u16_tag(obj, tags::BITS_ALLOCATED)? as usize;
+    let samples_per_pixel = read_u16_tag(obj, tags::SAMPLES_PER_PIXEL).unwrap_or(1) as usize;
+    let bytes_per_pixel = (bits_allocated / 8) * samples_per_pixel;
+
+    let elem = obj
+        .element(tags::PIXEL_DATA)
+        .map_err(|_| DeidError::Dicom("missing PixelData element".into()))?;
+    let vr = elem.header().vr();
+
+    let mut pixel_data = match elem.value() {
+        Value::Primitive(_) => elem
+            .value()
+            .to_bytes()
+            .map_err(|e| DeidError::Dicom(format!("cannot read pixel data: {}", e)))?
+            .to_vec(),
+        Value::PixelSequence { .. } => {
+            return Err(DeidError::CompressedPixelData(
+                "encapsulated pixel data detected; decompression is not supported".into(),
+            ));
+        }
+        _ => {
+            return Err(DeidError::Dicom("unexpected pixel data value type".into()));
+        }
+    };
+
+    // Build per-pixel mask: true = keep, false = zero out
+    let total_pixels = rows * cols;
+    let mut mask = vec![true; total_pixels];
+
+    // First pass: apply mask regions (keep=false)
+    for region in regions.iter().filter(|r| !r.keep) {
+        let ymin = (region.ymin as usize).min(rows);
+        let ymax = (region.ymax as usize).min(rows);
+        let xmin = (region.xmin as usize).min(cols);
+        let xmax = (region.xmax as usize).min(cols);
+        for row in ymin..ymax {
+            for col in xmin..xmax {
+                mask[row * cols + col] = false;
+            }
+        }
+    }
+
+    // Second pass: carve out keep regions (keep=true overrides mask)
+    for region in regions.iter().filter(|r| r.keep) {
+        let ymin = (region.ymin as usize).min(rows);
+        let ymax = (region.ymax as usize).min(rows);
+        let xmin = (region.xmin as usize).min(cols);
+        let xmax = (region.xmax as usize).min(cols);
+        for row in ymin..ymax {
+            for col in xmin..xmax {
+                mask[row * cols + col] = true;
+            }
+        }
+    }
+
+    // Apply mask to pixel bytes
+    for (i, keep) in mask.iter().enumerate() {
+        if !keep {
+            let offset = i * bytes_per_pixel;
+            let end = (offset + bytes_per_pixel).min(pixel_data.len());
+            for byte in &mut pixel_data[offset..end] {
+                *byte = 0;
+            }
+        }
+    }
+
+    // Write back
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        vr,
+        Value::Primitive(PrimitiveValue::U8(pixel_data.into())),
+    ));
+
+    Ok(())
 }
 
 /// Convert CTP coordinates (x, y, width, height) to standard coordinates

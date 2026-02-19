@@ -1,13 +1,67 @@
 use crate::recipe::{
     Condition, CoordinateRegion, FilterLabel, FilterType, LogicalOp, Predicate, Recipe,
 };
+use dicom_core::value::PrimitiveValue;
 use dicom_object::InMemDicomObject;
+use regex::Regex;
+
+/// Resolve a DICOM field value as a string, returning None if the field is missing.
+fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
+    obj.element_by_name(field)
+        .ok()
+        .and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
+}
 
 /// Evaluate a single filter predicate against a DICOM object.
 ///
 /// Field names in predicates are resolved to DICOM tags by keyword lookup.
 pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool {
-    todo!()
+    match predicate {
+        Predicate::Contains { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return false;
+            };
+            let pattern = format!("(?i){}", value);
+            match Regex::new(&pattern) {
+                Ok(re) => re.is_match(&field_val),
+                Err(_) => field_val.to_lowercase().contains(&value.to_lowercase()),
+            }
+        }
+        Predicate::NotContains { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return true;
+            };
+            let pattern = format!("(?i){}", value);
+            match Regex::new(&pattern) {
+                Ok(re) => !re.is_match(&field_val),
+                Err(_) => !field_val.to_lowercase().contains(&value.to_lowercase()),
+            }
+        }
+        Predicate::Equals { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return false;
+            };
+            field_val.to_lowercase() == value.to_lowercase()
+        }
+        Predicate::NotEquals { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return true;
+            };
+            field_val.to_lowercase() != value.to_lowercase()
+        }
+        Predicate::Missing { field } => obj.element_by_name(field).is_err(),
+        Predicate::Empty { field } => match obj.element_by_name(field) {
+            Ok(elem) => match elem.value() {
+                dicom_core::value::Value::Primitive(prim) => match prim {
+                    PrimitiveValue::Empty => true,
+                    _ => elem.value().to_str().map(|s| s.is_empty()).unwrap_or(true),
+                },
+                _ => false,
+            },
+            Err(_) => false,
+        },
+        Predicate::Present { field } => obj.element_by_name(field).is_ok(),
+    }
 }
 
 /// Evaluate a list of conditions with logical operators against a DICOM object.
@@ -15,7 +69,16 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
 /// Conditions are evaluated left-to-right: each AND/OR operator combines the
 /// running result with the current condition's result.
 pub fn evaluate_conditions(conditions: &[Condition], obj: &InMemDicomObject) -> bool {
-    todo!()
+    let mut result = false;
+    for condition in conditions {
+        let pred_result = evaluate_predicate(&condition.predicate, obj);
+        result = match condition.operator {
+            LogicalOp::First => pred_result,
+            LogicalOp::And => result && pred_result,
+            LogicalOp::Or => result || pred_result,
+        };
+    }
+    result
 }
 
 /// Check whether a filter label's conditions match the given DICOM object.
@@ -28,13 +91,34 @@ pub fn matches_label(label: &FilterLabel, obj: &InMemDicomObject) -> bool {
 /// Returns `true` if the object matches any label within any blacklist filter
 /// section, meaning it should be excluded from output.
 pub fn is_blacklisted(recipe: &Recipe, obj: &InMemDicomObject) -> bool {
-    todo!()
+    for section in &recipe.filters {
+        if section.filter_type != FilterType::Blacklist {
+            continue;
+        }
+        for label in &section.labels {
+            if matches_label(label, obj) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Collect all coordinate regions from graylist filters whose conditions match
 /// the given DICOM object.
 pub fn get_graylist_regions(recipe: &Recipe, obj: &InMemDicomObject) -> Vec<CoordinateRegion> {
-    todo!()
+    let mut regions = Vec::new();
+    for section in &recipe.filters {
+        if section.filter_type != FilterType::Graylist {
+            continue;
+        }
+        for label in &section.labels {
+            if matches_label(label, obj) {
+                regions.extend(label.coordinates.clone());
+            }
+        }
+    }
+    regions
 }
 
 #[cfg(test)]

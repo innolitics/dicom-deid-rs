@@ -11,6 +11,9 @@ pub enum DeidError {
     #[error("Tag resolution error: {0}")]
     TagResolution(String),
 
+    #[error("Compressed pixel data cannot be masked without decompression: {0}")]
+    CompressedPixelData(String),
+
     #[error("DICOM error: {0}")]
     Dicom(String),
 
