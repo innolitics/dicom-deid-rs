@@ -131,7 +131,7 @@ REPLACE SOPInstanceUID func:hashuid
 REPLACE StudyInstanceUID func:hashuid
 REPLACE SeriesInstanceUID func:hashuid
 REPLACE FrameOfReferenceUID func:hashuid
-REPLACE AccessionNumber func:hash_accession
+REPLACE AccessionNumber func:hashuid
 REPLACE UID func:hashuid
 
 # --- REPLACE with var: references --------------------------------------------
