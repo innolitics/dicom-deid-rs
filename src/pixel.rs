@@ -3,7 +3,8 @@ use crate::recipe::CoordinateRegion;
 use dicom_core::DataElement;
 use dicom_core::value::{PrimitiveValue, Value};
 use dicom_dictionary_std::tags;
-use dicom_object::InMemDicomObject;
+use dicom_object::{FileDicomObject, InMemDicomObject};
+use dicom_pixeldata::PixelDecoder;
 
 /// Read a u16 value from a DICOM tag, returning an error if missing or invalid.
 fn read_u16_tag(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Result<u16, DeidError> {
@@ -13,6 +14,46 @@ fn read_u16_tag(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Result<u16, Dei
     elem.value()
         .to_int::<u16>()
         .map_err(|_| DeidError::Dicom(format!("cannot read tag {:?} as u16", tag)))
+}
+
+/// Decompress encapsulated (compressed) pixel data in-place.
+///
+/// If the pixel data is already uncompressed or absent, this is a no-op.
+/// After decompression the transfer syntax is updated to Explicit VR Little
+/// Endian (1.2.840.10008.1.2.1).
+pub fn decompress_pixel_data(obj: &mut FileDicomObject<InMemDicomObject>) -> Result<(), DeidError> {
+    // No pixel data → nothing to do
+    let elem = match obj.element(tags::PIXEL_DATA) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+
+    // Already uncompressed → no-op
+    if !matches!(elem.value(), Value::PixelSequence { .. }) {
+        return Ok(());
+    }
+
+    let vr = elem.header().vr();
+
+    // Decode using dicom-pixeldata's PixelDecoder trait
+    let decoded = obj
+        .decode_pixel_data()
+        .map_err(|e| DeidError::Dicom(format!("pixel decompression failed: {}", e)))?;
+    let raw_bytes = decoded.data().to_vec();
+
+    // Replace PixelData with uncompressed bytes
+    obj.put(DataElement::new(
+        tags::PIXEL_DATA,
+        vr,
+        Value::Primitive(PrimitiveValue::U8(raw_bytes.into())),
+    ));
+
+    // Update transfer syntax to Explicit VR Little Endian
+    obj.update_meta(|meta| {
+        meta.transfer_syntax = "1.2.840.10008.1.2.1".to_string();
+    });
+
+    Ok(())
 }
 
 /// Apply pixel masking to a DICOM object.
@@ -47,7 +88,7 @@ pub fn apply_pixel_mask(
             .to_vec(),
         Value::PixelSequence { .. } => {
             return Err(DeidError::CompressedPixelData(
-                "encapsulated pixel data detected; decompression is not supported".into(),
+                "encapsulated pixel data detected; call decompress_pixel_data() first".into(),
             ));
         }
         _ => {
@@ -385,5 +426,54 @@ mod tests {
             1,
             "matching filter should return its regions"
         );
+    }
+
+    // -- r-4-7 ---------------------------------------------------------------
+
+    /// Requirement r-4-7: decompress is a no-op for uncompressed pixel data
+    #[test]
+    fn r4_7_decompress_noop_for_uncompressed() {
+        let mut file_obj = create_test_file_obj();
+        put_u16(&mut file_obj, tags::ROWS, VR::US, 4);
+        put_u16(&mut file_obj, tags::COLUMNS, VR::US, 4);
+        put_str(
+            &mut file_obj,
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "MONOCHROME2",
+        );
+        put_u16(&mut file_obj, tags::BITS_ALLOCATED, VR::US, 8);
+        put_u16(&mut file_obj, tags::BITS_STORED, VR::US, 8);
+        put_u16(&mut file_obj, tags::HIGH_BIT, VR::US, 7);
+        put_u16(&mut file_obj, tags::PIXEL_REPRESENTATION, VR::US, 0);
+        put_u16(&mut file_obj, tags::SAMPLES_PER_PIXEL, VR::US, 1);
+
+        let pixels = vec![128u8; 16];
+        file_obj.put(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            Value::Primitive(PrimitiveValue::U8(pixels.clone().into())),
+        ));
+
+        decompress_pixel_data(&mut file_obj).expect("should succeed");
+
+        // Transfer syntax should be unchanged
+        assert_eq!(file_obj.meta().transfer_syntax(), "1.2.840.10008.1.2.1");
+
+        // Pixel data should be unchanged
+        let bytes = file_obj
+            .element(tags::PIXEL_DATA)
+            .unwrap()
+            .value()
+            .to_bytes()
+            .unwrap();
+        assert_eq!(bytes.as_ref(), &pixels[..]);
+    }
+
+    /// Requirement r-4-7: decompress is a no-op when no pixel data present
+    #[test]
+    fn r4_7_decompress_noop_for_no_pixel_data() {
+        let mut file_obj = create_test_file_obj();
+        decompress_pixel_data(&mut file_obj).expect("should succeed with no pixel data");
     }
 }

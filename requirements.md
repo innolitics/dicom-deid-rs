@@ -60,6 +60,9 @@ r-4-4 The software must support "keep" regions that are excluded from masking (i
 r-4-5 A single filter group may define multiple coordinate regions to mask
 r-4-6 Pixel masking regions must only be applied when the associated filter group's conditions match the DICOM file being processed
 
+r-4-7 The software must support decompressing compressed pixel data before applying pixel masking. At minimum, the following transfer syntaxes must be supported: JPEG Baseline (1.2.840.10008.1.2.4.50), JPEG Lossless (1.2.840.10008.1.2.4.70), and RLE Lossless (1.2.840.10008.1.2.5). JPEG 2000 Lossless (1.2.840.10008.1.2.4.90) and JPEG 2000 (1.2.840.10008.1.2.4.91) must be supported when built with the jpeg2000 feature.
+r-4-8 After decompressing and masking pixel data, the output must be stored as uncompressed pixel data and the transfer syntax updated to Explicit VR Little Endian (1.2.840.10008.1.2.1).
+
 r-5 File Filtering
 r-5-1 The software must support excluding DICOM files from processing entirely based on %filter blacklist rules. Files matching blacklist criteria must not appear in the output.
 
