@@ -1,5 +1,5 @@
 use crate::error::DeidError;
-use crate::filter;
+use crate::filter_index::FilterIndex;
 use crate::functions;
 use crate::metadata;
 use crate::metadata::DeidFunction;
@@ -31,6 +31,7 @@ pub struct DeidReport {
 pub struct DeidPipeline {
     pub config: DeidConfig,
     pub recipe: Recipe,
+    filter_index: FilterIndex,
 }
 
 enum FileOutcome {
@@ -53,7 +54,12 @@ impl DeidPipeline {
             merged.insert(name, func);
         }
         config.functions = merged;
-        Ok(DeidPipeline { config, recipe })
+        let filter_index = FilterIndex::new(&recipe);
+        Ok(DeidPipeline {
+            config,
+            recipe,
+            filter_index,
+        })
     }
 
     /// Recursively search a directory for DICOM files.
@@ -113,12 +119,12 @@ impl DeidPipeline {
         })?;
 
         // Check blacklist
-        if let Some(reason) = filter::blacklist_reason(&self.recipe, &obj) {
+        if let Some(reason) = self.filter_index.blacklist_reason(&obj) {
             return Ok(FileOutcome::Blacklisted(reason.to_string()));
         }
 
         // Pixel de-identification
-        let regions = filter::get_graylist_regions(&self.recipe, &obj);
+        let regions = self.filter_index.get_graylist_regions(&obj);
         if !regions.is_empty() {
             pixel::decompress_pixel_data(&mut obj)?;
             pixel::apply_pixel_mask(&mut obj, &regions)?;

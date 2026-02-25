@@ -6,7 +6,7 @@ use dicom_object::InMemDicomObject;
 use regex::Regex;
 
 /// Resolve a DICOM field value as a string, returning None if the field is missing.
-fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
+pub fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
     obj.element_by_name(field)
         .ok()
         .and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
@@ -71,6 +71,12 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
 pub fn evaluate_conditions(conditions: &[Condition], obj: &InMemDicomObject) -> bool {
     let mut result = false;
     for condition in conditions {
+        // Short-circuit: skip evaluation when result is already determined
+        match condition.operator {
+            LogicalOp::And if !result => continue,
+            LogicalOp::Or if result => continue,
+            _ => {}
+        }
         let pred_result = evaluate_predicate(&condition.predicate, obj);
         result = match condition.operator {
             LogicalOp::First => pred_result,
