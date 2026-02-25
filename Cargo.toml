@@ -3,6 +3,11 @@ name = "dicom-deid-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "dicom-deid-rs"
+path = "src/main.rs"
+required-features = ["pipeline"]
+
 [dependencies]
 dicom-object = "0.8"
 dicom-core = "0.8"
@@ -11,12 +16,13 @@ dicom-pixeldata = { version = "0.8", default-features = false, features = ["nati
 sha2 = "0.10"
 regex = "1"
 thiserror = "2"
-chrono = "0.4"
-indicatif = "0.17"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+indicatif = { version = "0.17", optional = true }
 
 [features]
-default = ["jpeg2000"]
-jpeg2000 = ["dicom-pixeldata/openjpeg-sys"]
+default = ["pipeline", "jpeg2000"]
+pipeline = ["dep:indicatif"]
+jpeg2000 = ["dicom-pixeldata/openjp2"]
 
 [dev-dependencies]
 tempfile = "3"
