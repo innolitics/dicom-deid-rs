@@ -1,0 +1,6 @@
+[submodule "resources/MIRC2"]
+	path = resources/MIRC2
+	url = git@github.com:RSNA/MIRC2.git
+[submodule "resources/deid"]
+	path = resources/deid
+	url = git@github.com:pydicom/deid.git
