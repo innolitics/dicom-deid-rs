@@ -10,8 +10,11 @@ This project is in very early stages of development-- consider it alpha software
 This repository was primarily developed using Claude Code, leveraging two
 extremely well-constructed de-identification libraries as references:
 
-- MIRC2, otherwise known as RSNA's Clinical Trial Processor (CTP)
-- pydicom-deid, an excellent DICOM de-identification library from the pydicom team.
+- [MIRC2][mirc2], otherwise known as RSNA's Clinical Trial Processor (CTP)
+- [pydicom-deid][deid], an excellent DICOM de-identification library from the pydicom team.
+
+[mirc2]: https://github.com/RSNA/MIRC2
+[deid]: https://github.com/pydicom/deid/
 
 While both of these libraries are tested and used widely, we found a need for a
 very performance-focused implementation that can easily embed into web
