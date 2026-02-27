@@ -1,6 +1,29 @@
 # dicom-deid-rs
 
-A DICOM de-identification tool written in Rust. Removes or masks protected health information (PHI) from DICOM files based on a configurable recipe file.
+A DICOM de-identification tool written in Rust. Removes or masks protected
+health information (PHI) from DICOM files based on a configurable recipe file.
+
+This project is in very early stages of development-- consider it alpha software!
+
+## Methods
+
+This repository was primarily developed using Claude Code, leveraging two
+extremely well-constructed de-identification libraries as references:
+
+- MIRC2, otherwise known as RSNA's Clinical Trial Processor (CTP)
+- pydicom-deid, an excellent DICOM de-identification library from the pydicom team.
+
+While both of these libraries are tested and used widely, we found a need for a
+very performance-focused implementation that can easily embed into web
+deployment contexts. Thus, we adopted a spec-driven development approach where
+we iterated on an initial set of requirements by manually drafting and
+comparing with implementation details within these two repositories. Once we
+achieved an acceptable level of feature parity, we then focused on performance
+improvements.
+
+Our many thanks to the dedicated authors of MIRC2, pydicom-deid, and the many
+other open-source libraries whose work laid a solid foundation for this
+project.
 
 ## Features
 
