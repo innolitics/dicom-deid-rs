@@ -1,0 +1,1121 @@
+FORMAT dicom
+%filter graylist
+
+# Flags only
+
+LABEL Stanford Med Reconstruction # (Vanessa Sochat)
+  missing Manufacturer || empty Manufacturer
+  + contains ImageType RECONSTRUCTION|SECONDARY|DERIVED
+
+LABEL LightSpeed Dose Report # (Susan Weber)
+  contains ManufacturerModelName LightSpeed VCT
+  + contains Modality CT
+  + contains ImageType SCREEN SAVE || contains SeriesDescription Dose
+  coordinates 0,0,512,121
+
+LABEL LightSpeed Localizers # (Susan Weber)
+  contains ManufacturerModelName LightSpeed VCT
+  + contains Modality CT
+  + contains ImageType LOCAL || contains SeriesDescription Localizer
+  coordinates 0,0,80,85
+
+LABEL Stanford CT GE Medical Systems LightSpeed VCT # (Susan Weber)
+  contains ManufacturerModelName LightSpeed VCT
+  + contains Modality CT
+
+LABEL Enhancement Curve # (Susan Weber)
+  contains ManufacturerModelName SOMATOM Definition AS+
+  + contains Modality CT
+  + contains ImageType OTHER || contains SeriesDescription Enhancement
+  coordinates 0,0,512,121
+
+LABEL Somatom Localizers # (Susan Weber)
+  contains ManufacturerModelName SOMATOM Definition AS+
+  + contains Modality CT
+  + contains ImageType LOCAL || contains SeriesDescription Localizer
+  coordinates 0,0,80,85
+
+LABEL 3D Lab reconstructions # (Susan Weber)
+  contains ManufacturerModelName SOMATOM Definition AS+
+  + contains Modality CT
+  + contains SeriesDescription 3D
+coordinates 450,0,672, 85
+
+LABEL CT Siemens SOMATOM Catch-all # (Susan Weber)
+  contains ManufacturerModelName SOMATOM Definition AS+
+  + contains Modality CT
+
+LABEL CT Dose Series # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + contains CodeMeaning IEC Body Dosimetry Phantom
+  ctpcoordinates 0,0,512,200
+
+LABEL Dose Report # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + contains SeriesDescription Dose Report
+  ctpcoordinates 0,0,512,110
+
+LABEL Dose Report Comments # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + contains CommentsOnRadiationDose DLP
+  ctpcoordinates 0,0,512,110
+
+LABEL AW Workstation # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + contains BurnedInAnnotation YES
+  + contains Manufacturer GE MEDICAL
+  + contains SeriesDescription AW electronic field
+  ctpcoordinates 0,0,512,80
+
+LABEL Screen Captures # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + equals Rows 512
+  + contains BurnedInAnnotation YES
+  + contains Manufacturer GE MEDICAL
+  ctpcoordinates 0,0,512,25
+
+LABEL Vessel analysis (screen capture) # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + equals Rows 512
+  + contains BurnedInAnnotation YES
+  + contains Manufacturer GE MEDICAL
+  + contains SeriesDescription AVA Report
+  ctpcoordinates 0,0,200,250
+
+LABEL Volume Rendering - MRCP  # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + equals Rows 512
+  + equals Columns 512
+  + contains BurnedInAnnotation YES
+  + contains ImageType VOLREN
+  ctpcoordinates 350,0,162,30
+  ctpcoordinates 390,80,122,15
+
+LABEL screen captures # (CTP)
+  contains Modality CT
+  + contains Manufacturer GE
+  + equals Rows 1024
+  + contains BurnedInAnnotation YES
+  ctpcoordinates 0,0,300,150
+  ctpcoordinates 724,0,300,150
+
+LABEL stent planning worksheet (VITREA) # (CTP)
+  contains Modality CT
+  + contains Manufacturer VITREA
+  + equals Rows 1041
+  + contains Manufacturer VITAL Images|VITREA
+  + contains SeriesDescription AAA|Report
+  ctpcoordinates 0,0,795,150
+
+LABEL CT Dose Series # (CTP)
+  contains Modality CT
+  + contains Manufacturer SIEMENS
+  + equals Rows 860
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,1132,60
+
+LABEL CT Dose Series # (CTP)
+  contains Modality CT
+  + contains Manufacturer PHILIPS
+  + contains ImageType DOSE
+  ctpcoordinates 0,0,512,135
+
+LABEL SIEMMENS  # (CTP)
+  contains Modality US
+  + contains Manufacturer SIEMENS
+  + contains ManufacturerModelName S2000
+  + equals Rows 768
+  + equals Columns 1024
+  ctpcoordinates 0,0,1024,60
+
+LABEL Toshiba Aquilion One CT Dose Series # (CTP)
+  contains Modality CT
+  + contains Manufacturer TOSHIBA
+  + equals Rows 512
+  + equals Columns 512
+  + equals WindowWidth 1
+  + contains ManufacturerModelName Aquilion ONE
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,410,240
+
+LABEL Overlay # (CTP)
+  contains Modality PET/CT
+  + contains Manufacturer SIEMENS
+  + contains OverlayDescription Siemens MedCom Object Graphics
+  ctpcoordinates 0,0,512,90
+
+
+LABEL Philips PT # (CTP)
+  contains Modality PT
+  + contains Manufacturer Philips
+  + contains ManufacturerModelName GEMINI
+  + equals Rows 446
+  + equals Columns 245
+  ctpcoordinates 0,0,125,50
+
+LABEL Philips PT # (CTP)
+  contains Modality PT
+  + contains Manufacturer Philips
+  + contains ManufacturerModelName GEMINI
+  + equals Rows 445
+  + equals Columns 493
+  ctpcoordinates 0,0,140,55
+
+LABEL Philips PT # (CTP)
+  contains Modality PT
+  + contains Manufacturer Philips
+  + contains ManufacturerModelName GEMINI
+  + equals Rows 373
+  + equals Columns 492
+  ctpcoordinates 0,0,100,25
+
+LABEL MINDRAY # (CTP)
+  contains Modality US
+  + contains ImplementationVersionName MINDRAY
+  ctpcoordinates 0,0,1229,69
+
+LABEL Logiq US (LOGIQ9) # (CTP)
+  contains Modality US
+  + contains Manufacturer GE
+  + contains ManufacturerModelName LOGIQ9
+  ctpcoordinates 0,0,640,30
+
+LABEL Logiq US (LOGIQE9 or V830) # (CTP)
+  contains Modality US
+  + contains Manufacturer GE
+  + contains ManufacturerModelName LOGIQE9|V830
+  ctpcoordinates 0,0,960,70
+
+LABEL Logiq US LOGIQE  # (AMBR)
+  contains Modality US
+  + contains Manufacturer GE
+  + equals Rows 614
+  + contains ManufacturerModelName LOGIQE
+  ctpcoordinates 0,0,1150,75
+
+LABEL Philips IU22 # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 480
+  + contains ManufacturerModelName iU22
+  ctpcoordinates 0,0,640,47
+
+LABEL Philips IU22 # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 786
+  + contains ManufacturerModelName iU22
+  ctpcoordinates 0,0,1024,75
+
+LABEL Philips IU22 # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 600
+  + contains ManufacturerModelName iU22
+  ctpcoordinates 0,0,800,59
+
+LABEL Philips Affiniti # (AMB)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 768
+  + contains ManufacturerModelName Affiniti 70G
+  ctpcoordinates 0,0,1024,22
+
+LABEL Philips Affiniti # (AMB)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 600
+  + contains ManufacturerModelName ClearVue 650
+  ctpcoordinates 0,0,1150,22
+
+LABEL Philips Affiniti # (AMB)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 825
+  + contains ManufacturerModelName Affiniti 70G
+  ctpcoordinates 0,0,1140,70
+
+LABEL EPIQ 7G # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 600
+  + contains ManufacturerModelName EPIQ
+  ctpcoordinates 0,0,1024,49
+
+LABEL EPIQ 7G # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 768
+  + contains ManufacturerModelName EPIQ
+  ctpcoordinates 0,0,1024,49
+
+LABEL EPIQ 7G # (FFUR)
+  contains Modality US
+  + contains Manufacturer Philips
+  + equals Rows 825
+  + contains ManufacturerModelName EPIQ
+  ctpcoordinates 0,0,800,59
+
+LABEL CX50 # (CTP)
+  contains Modality US
+  + contains Manufacturer Philips
+  + contains ManufacturerModelName CX50
+  ctpcoordinates 0,0,800,59
+
+LABEL EPIQ_7G (CTP)
+  + contains Manufacturer EPIQ
+  + equals Rows 600|768
+  ctpcoordinates 0,0,800,59
+
+LABEL Z_ONE # (CTP)
+  contains Modality US
+  + contains Manufacturer Zonare
+  + equals Rows 600
+  + contains ManufacturerModelName Z_ONE
+  ctpcoordinates 0,0,800,65
+
+LABEL Z_ONE # (FFUR)
+  contains Modality US
+  + contains Manufacturer Zonare
+  + equals Rows 600
+  + contains ManufacturerModelName ZS3
+  ctpcoordinates 0,0,1150,55
+
+LABEL ATL HDI 5000 # (CTP)
+  contains Modality US
+  + contains Manufacturer ATL
+  + equals Rows 476
+  + equals Columns 640
+  + contains ManufacturerModelName HDI 5000
+  ctpcoordinates 40,0,200,40
+  ctpcoordinates 240,0,190,16
+
+LABEL ATL HDI4000 # (FFUR)
+  contains Modality US
+  + contains Manufacturer ATL
+  + equals Rows 480
+  + contains ManufacturerModelName HDI4000
+  ctpcoordinates 0,0,1140,62
+
+LABEL Siemens SC2000 # (CTP)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 768
+  + equals Columns 1024
+  + contains ManufacturerModelName SC2000
+  + contains ImageType SECONDARY
+  ctpcoordinates 230,50,260,370
+
+LABEL Siemens Antares # (CTP)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 768
+  + equals Columns 1024
+  + contains ManufacturerModelName Antares
+  ctpcoordinates 0,0,1024,60
+  ctpcoordinates 200,60,20,20
+  ctpcoordinates 800,65,104,14
+
+LABEL Siemens Acuson # (FFUR)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 600
+  + contains ManufacturerModelName G40
+  ctpcoordinates 0,0,980,45
+
+LABEL Siemens Acuson # (FFUR)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 768
+  + contains ManufacturerModelName ACUSON NX3
+  ctpcoordinates 0,0,1150,58
+
+LABEL Siemens Acuson # (FFUR)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 600
+  + contains ManufacturerModelName X150
+  ctpcoordinates 0,0,1145,50
+
+LABEL Siemens Acuson # (FFUR)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 768
+  + contains ManufacturerModelName S3000
+  ctpcoordinates 0,0,1040,60
+
+LABEL Siemens Acuson # (FFUR)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 600
+  + equals Columns 800
+  + contains ManufacturerModelName ACUSON
+  ctpcoordinates 0,0,800,43
+  ctpcoordinates 128,56,16,16
+
+LABEL Siemens Acuson # (CTP)
+  contains Modality US
+  + contains Manufacturer Siemens
+  + equals Rows 600
+  + equals Columns 800
+  + contains ManufacturerModelName ACUSON
+  ctpcoordinates 0,0,800,43
+  ctpcoordinates 128,56,16,16
+
+LABEL Acuson Sequoia # (CTP)
+  contains Modality US
+  + contains Manufacturer ACUSON
+  + equals Rows 480
+  + equals Columns 640
+  + contains ManufacturerModelName SEQUOIA
+  ctpcoordinates 0,0,640,30
+
+LABEL Toshiba Aplio 400 or 500 # (CTP)
+  contains Modality US
+  + contains Manufacturer TOSHIBA
+  + equals Rows 720
+  + equals Columns 960
+  + contains ManufacturerModelName A400|A500
+  ctpcoordinates 0,0,960,60
+
+LABEL TOSHIBA # (FFUR)
+  contains Modality US
+  + contains Manufacturer TOSHIBA
+  + equals Rows 632
+  + contains ManufacturerModelName TUS-A300
+  ctpcoordinates 0,0,1150,72
+
+LABEL TOSHIBA # (FFUR)
+  contains Modality US
+  + contains Manufacturer TOSHIBA
+  + equals Rows 720
+  + contains ManufacturerModelName TUS-A300
+  ctpcoordinates 0,0,1150,68
+
+LABEL TOSHIBA # (FFUR)
+  contains Modality US
+  + contains Manufacturer TOSHIBA
+  + equals Rows 903
+  ctpcoordinates 0,0,930,50
+  + contains ManufacturerModelName TUS-A500
+
+LABEL TOSHIBA # (FFUR)
+  contains Modality US
+  + contains Manufacturer TOSHIBA
+  + equals Rows 632
+  + contains ManufacturerModelName TUS-A500
+  ctpcoordinates 0,0,1150,60
+
+LABEL Supersonic Imagine 5A # (CTP)
+  contains Modality US
+  + contains Manufacturer SuperSonic Imagine SA|SuperSonic
+  + equals Rows 1050
+  + equals Columns 1400
+  + contains ManufacturerModelName Aixplorer
+  ctpcoordinates 0,0,1400,89
+
+LABEL SENO # (CTP)
+  contains Modality US
+  + contains Manufacturer SENO
+  + equals Rows 1058
+  + equals Columns 1920
+  ctpcoordinates 161,0,1632,50
+
+LABEL SENO Cine # (CTP)
+  contains Modality US
+  + contains Manufacturer SENO
+  + equals Rows 1056
+  + equals Columns 1920
+  ctpcoordinates 161,0,1632,50
+
+LABEL Canon CR/DR # (CTP)
+  contains Modality MRI
+  + contains Manufacturer Canon
+  + equals Rows 2592
+  + contains ManufacturerModelName CXD1
+  ctpcoordinates 0,0,2208,80
+  ctpcoordinates 0,2512,2208,80
+
+LABEL Siemens NM # (CTP)
+  contains Modality NM
+  + contains Manufacturer Siemens
+  + equals Rows 860
+  + contains ManufacturerModelName CXD1
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,1132,90
+  ctpcoordinates 0,780,1132,80
+
+LABEL Siemens NM # (CTP)
+  contains Modality NM
+  + contains Manufacturer Siemens
+  + equals Rows 860
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,1132,90
+  ctpcoordinates 0,780,1132,80
+
+LABEL Siemens NM # (CTP)
+  contains Modality NM
+  + contains Manufacturer Siemens
+  + equals Rows 865
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,1132,35
+
+LABEL Siemens NM # (CTP)
+  contains Modality NM
+  + contains Manufacturer Siemens
+  + equals Rows 882
+  + contains ImageType SECONDARY
+  ctpcoordinates 0,0,1132,65
+
+LABEL ADAC # (CTP)
+  equals Rows 832
+  + equals Columns 1024
+  + contains Manfacturer ADAC
+  ctpcoordinates 0,0,1024,80
+  ctpcoordinates 0,762,1024,80
+
+LABEL ADAC # (CTP)
+  equals Rows 832
+  + equals Columns 1024
+  + contains Manfacturer ADAC
+  + contains ProtocolName DUAL DETEC
+  ctpcoordinates 0,0,1024,130
+  ctpcoordinates 0,762,1024,80
+
+LABEL MEDRAD Injection Profile # (CTP)
+  contains Modality Other
+  + contains Manufacture MEDRAD
+  + equals Rows 1077
+  + equals Columns 750
+  + contains SeriesDescription MEDRAD
+  ctpcoordinates 0,0,750,230
+
+LABEL ESAOTE # (FFUR)
+  contains Manufacturer ESAOTE
+  + contains Modality US
+  + contains ManufacturerModelName 6100
+  + equals Rows 608
+  ctpcoordinates 0,0,790,52
+
+LABEL ESAOTE # (FFUR)
+  contains Manufacturer ESAOTE
+  + contains Modality US
+  + contains ManufacturerModelName 6150
+  + equals Rows 804
+  ctpcoordinates 0,0,1030,45
+
+LABEL ESAOTE # (FFUR)
+  contains Manufacturer ESAOTE
+  + contains Modality US
+  + contains ManufacturerModelName 6150
+  + equals Rows 804
+  ctpcoordinates 0,0,1030,45
+
+LABEL ESAOTE # (FFUR)
+  contains Manufacturer ESAOTE
+  + contains Modality US
+  + contains ManufacturerModelName 6150
+  + equals Rows 608
+  ctpcoordinates 0,0,1140,72
+
+LABEL ESAOTE # (FFUR)
+  contains Manufacturer ESAOTE
+  + contains Modality US
+  + contains ManufacturerModelName 6150
+  + equals Rows 555
+  ctpcoordinates 0,0,1140,72
+
+LABEL MEDISON # (FFUR)
+  contains Manufacturer MEDISON
+  + contains Modality US
+  + contains ManufacturerModelName Accuvix V20
+  + equals Rows 768
+  ctpcoordinates 0,0,1010,65
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare Austria
+  + contains Modality US
+  + contains ManufacturerModelName Voluson P8
+  + equals Rows 727
+  ctpcoordinates 0,0,1150,65
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName Voluson P8
+  + equals Rows 727
+  ctpcoordinates 0,0,1150,65
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName Voluson S
+  + equals Rows 743
+  ctpcoordinates 0,0,925,62
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName Voluson S
+  + equals Rows 743
+  ctpcoordinates 0,0,925,62
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName Voluson S10
+  + equals Rows 852
+  ctpcoordinates 0,0,1040,62
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName Voluson S10
+  + equals Rows 600
+  ctpcoordinates 0,0,1040,62
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQS7
+  + equals Rows 720
+  ctpcoordinates 0,0,1060,67
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQS8
+  + equals Rows 873
+  ctpcoordinates 0,0,1160,65
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQS8
+  + equals Rows 768
+  ctpcoordinates 0,0,1150,60
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQS8
+  + equals Rows 819
+  ctpcoordinates 0,0,937,57
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQS8
+  + equals Rows 720
+  ctpcoordinates 0,0,1140,50
+
+LABEL GE Healthcare # (FFUR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQP
+  + equals Rows 614
+  ctpcoordinates 0,0,1060,67
+
+LABEL GE Healthcare # (AMBR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQ S6
+  + equals Rows 768
+  ctpcoordinates 0,0,800,80
+
+LABEL GE Healthcare # (AMBR)
+  contains Manufacturer GE Healthcare
+  + contains Modality US
+  + contains ManufacturerModelName LOGIQ7
+  + equals Rows 989
+  ctpcoordinates 0,0,1150,24
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName M6
+  + equals Rows 600
+  ctpcoordinates 0,0,1050,75
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName M7
+  + equals Rows 600
+  ctpcoordinates 0,0,800,50
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName M7
+  + equals Rows 768
+  ctpcoordinates 0,0,1080,80
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName Z5
+  + equals Rows 600
+  ctpcoordinates 0,0,1130,62
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName DC-8 PRO
+  + equals Rows 900
+  ctpcoordinates 0,0,1150,60
+
+LABEL MINDRAY # (AMBR)
+  contains Manufacturer MINDRAY
+  + contains Modality US
+  + contains ManufacturerModelName M9
+  + equals Rows 910
+  ctpcoordinates 0,0,1150,60
+
+LABEL SIUI # (AMBR)
+  contains Manufacturer SIUI
+  + contains Modality US
+  + contains ManufacturerModelName CTS-8800
+  ctpcoordinates 0,0,1360,100
+
+LABEL Kretztechnik # (AMBR)
+  contains Manufacturer Kretztechnik
+  + contains Modality US
+  + contains ManufacturerModelName V730
+  + equals Rows 600
+  ctpcoordinates 0,0,1140,80
+
+LABEL Hitachi # (AMBR)
+  contains Manufacturer Hitachi
+  + contains Modality US
+  + contains ManufacturerModelName HI VISION Preirus
+  + equals Rows 768
+  ctpcoordinates 0,0,1150,60
+
+LABEL Hitachi # (AMBR)
+  contains Manufacturer Hitachi
+  + contains Modality US
+  + contains ManufacturerModelName HI VISION Avius
+  + equals Rows 768
+  ctpcoordinates 0,0,1140,74
+
+LABEL Hitachi # (AMBR)
+  contains Manufacturer Hitachi
+  + contains Modality US
+  + contains ManufacturerModelName ProSound F75
+  + equals Rows 768
+  ctpcoordinates 0,0,1025,50
+
+LABEL Samsung # (AMBR)
+  contains Manufacturer Samsung
+  + contains Modality US
+  + contains ManufacturerModelName UGEO H60
+  + equals Rows 720
+  ctpcoordinates 0,0,1150,70
+
+LABEL Samsung # (AMBR)
+  contains Manufacturer Samsung
+  + contains Modality US
+  + contains ManufacturerModelName SonoAce R7
+  + equals Rows 768
+  ctpcoordinates 0,0,1024,60
+
+LABEL MEDISON # (AMBR)
+  contains Manufacturer MEDISON
+  + contains Modality US
+  + contains ManufacturerModelName SonoAce R7
+  + equals Rows 768
+  ctpcoordinates 0,0,1140,60
+
+LABEL Chison # (AMBR)
+  contains Manufacturer Chison
+  + contains Modality US
+  + contains ManufacturerModelName q9-new
+  + equals Rows 568
+  ctpcoordinates 0,0,1250,80
+
+LABEL Ultrasonix # (AMBR)
+  contains Manufacturer Ultrasonix
+  + contains Modality US
+  + contains ManufacturerModelName SONIX
+  + equals Rows 768
+  ctpcoordinates 0,0,970,60
+
+LABEL Ultrasonix # (AMBR)
+  contains Manufacturer Ultrasonix
+  + contains Modality US
+  + contains ManufacturerModelName SONIX
+  + equals Rows 600
+  ctpcoordinates 0,0,970,60
+
+LABEL Stanford Medical Center LightSpeed VCT # (Roger Goldman)
+  contains Manufacturer GE
+  + contains Modality CT
+  + contains ManufacturerModelName GE|Stanford
+  + contains SeriesDescription Dose || contains ImageType SCREEN SAVE
+  coordinates 0,0,512,121
+
+LABEL Stanford Medical Center GE # (Roger Goldman)
+  contains Manufacturer GE
+  + contains ManufacturerModelName GE|Stanford
+  + contains ImageType DERIVED+SECONDARY+SCREEN SAVE
+  coordinates 0,0,512,121
+
+LABEL Stanford Medicine Outpatient center
+  contains Manufacturer Siemens
+  + contains ManufacturerModelName SOMATOM Definition AS+
+  + contains ImageType DERIVED|SECONDARY|SCREEN SAVE|VOLREN|VXTL STATE
+
+%filter blacklist
+
+LABEL Any Scanned Document or Secondary Save
+  contains ImageType Secondary
+  contains Modality OT
+
+LABEL Any REPORTDATA
+  contains ImageType REPORTDATA
+
+LABEL Any DEMOGRAPHICDATA, INVALID # (AMB)
+  contains ImageType DEMOGRAPHICDATA
+  contains ImageType INVALID
+
+LABEL Stanford Blacklist Missing ImageType  # Susan Weber, Vanessa Sochat
+  missing ImageType || empty ImageType
+
+LABEL Stanford Blacklist secondary or derived catchall # Vanessa Sochat
+  contains Modality CT|MR
+  + contains ImageType DERIVED|SECONDARY|SCREEN|SAVE
+
+LABEL Stanford Blacklist Dose Report or External # Vanessa Sochat
+  contains Modality CT|MR
+  + contains SeriesDescription Patient Protocol|PACS nomination form|Dose Report|Study acquired outside hospital
+
+LABEL Burned In Annotation # (CTP)
+  contains ImageType SAVE
+  + contains Modality CT|MR
+  || contains SeriesDescription SAVE
+  || contains BurnedInAnnotation YES
+  || empty ImageType
+  || empty DateOfSecondaryCapture
+  || empty SecondaryCaptureDeviceManufacturer
+  || empty SecondaryCaptureDeviceManufacturerModelName
+  || empty SecondaryCaptureDeviceSoftwareVersions`;
+
+/**
+ * Ported from iCore / AI-Miner, which implements this as a CTP XML profile, merged with a user configuration
+ * - XML: https://github.com/innolitics/aiminer/blob/9353daad9de65961b733dcbd5409ed199b06db64/ctp/scripts/DicomAnonymizer.script
+ * - Example config (default): https://github.com/innolitics/aiminer/blob/9353daad9de65961b733dcbd5409ed199b06db64/deid/home/settings.json
+ *
+ * WARNING: This relies on certain python functions being present within
+ * the runtime environment
+ */
+
+%header
+
+ADD DeidentificationMethod func:append_deid_method element_name=DeidentificationMethod
+ADD LongitudinalTemporalInformationModified MODIFIED
+KEEP SpecificCharacterSet YES
+JITTER InstanceCreationDate var:DATEINC
+REPLACE InstanceCreatorUID func:hashuid
+KEEP SOPClassUID YES
+REPLACE SOPInstanceUID func:hashuid
+JITTER StudyDate var:DATEINC
+JITTER SeriesDate var:DATEINC
+JITTER AcquisitionDate var:DATEINC
+JITTER ContentDate var:DATEINC
+JITTER OverlayDate var:DATEINC
+JITTER CurveDate var:DATEINC
+JITTER AcquisitionDateTime var:DATEINC
+KEEP StudyTime YES
+KEEP SeriesTime YES
+KEEP AcquisitionTime YES
+KEEP ContentTime YES
+KEEP OverlayTime YES
+KEEP CurveTime YES
+REPLACE AccessionNumber func:hash_accession
+REPLACE FailedSOPInstanceUIDList func:hashuid
+#REPLACE Modality func:require element_name=None default_value=None
+KEEP Manufacturer YES
+REMOVE InstitutionName YES
+REMOVE InstitutionAddress YES
+REMOVE InstitutionCodeSeq YES
+BLANK ReferringPhysicianName YES
+REMOVE ReferringPhysicianAddress YES
+REMOVE ReferringPhysicianPhoneNumbers YES
+REMOVE ReferringPhysiciansIDSeq YES
+#REPLACE PrivateCodingSchemeCreatorUID func:hashuid
+REPLACE CodeSetExtensionCreatorUID func:hashuid
+REMOVE TimezoneOffsetFromUTC YES
+REMOVE StationName YES
+REMOVE StudyDescription YES
+KEEP SeriesDescription YES
+REMOVE InstitutionalDepartmentName YES
+REMOVE PhysicianOfRecord YES
+REMOVE PhysicianOfRecordIdSeq YES
+REMOVE PerformingPhysicianName YES
+REMOVE PerformingPhysicianIdSeq YES
+REMOVE NameOfPhysicianReadingStudy YES
+REMOVE PhysicianReadingStudyIdSeq YES
+REMOVE OperatorName YES
+REMOVE OperatorsIdentificationSeq YES
+REMOVE AdmittingDiagnosisDescription YES
+REMOVE AdmittingDiagnosisCodeSeq YES
+KEEP ManufacturerModelName YES
+REMOVE RefStudySeq YES
+REMOVE RefPPSSeq YES
+REMOVE RefPatientSeq YES
+REMOVE RefImageSeq YES
+KEEP RefSOPClassUID YES
+REPLACE RefSOPInstanceUID func:hashuid
+REPLACE TransactionUID func:hashuid
+REMOVE DerivationDescription YES
+REMOVE SourceImageSeq YES
+REPLACE IrradiationEventUID func:hashuid
+REMOVE IdentifyingComments YES
+REPLACE CreatorVersionUID func:hashuid
+ADD PatientName func:set_to_trial_and_patient_identifier element_name=PatientName
+ADD PatientID func:set_to_trial_identifier element_name=PatientID
+REMOVE IssuerOfPatientID YES
+BLANK PatientBirthDate YES
+REMOVE PatientBirthTime YES
+KEEP PatientSex YES
+REMOVE PatientInsurancePlanCodeSeq YES
+REMOVE PatientPrimaryLanguageCodeSeq YES
+REMOVE PatientPrimaryLanguageModifierCodeSeq YES
+REMOVE OtherPatientIDs YES
+REMOVE OtherPatientNames YES
+REMOVE OtherPatientIDsSeq YES
+REMOVE PatientBirthName YES
+KEEP PatientAge YES
+KEEP PatientSize YES
+KEEP PatientWeight YES
+REMOVE PatientAddress YES
+REMOVE InsurancePlanIdentification YES
+REMOVE PatientMotherBirthName YES
+REMOVE MilitaryRank YES
+REMOVE BranchOfService YES
+REMOVE MedicalRecordLocator YES
+REMOVE MedicalAlerts YES
+REMOVE ContrastAllergies YES
+REMOVE CountryOfResidence YES
+REMOVE RegionOfResidence YES
+REMOVE PatientPhoneNumbers YES
+REMOVE PatientTelecomInformation YES
+KEEP EthnicGroup YES
+REMOVE Occupation YES
+KEEP SmokingStatus YES
+REMOVE AdditionalPatientHistory YES
+KEEP PregnancyStatus YES
+JITTER LastMenstrualDate var:DATEINC
+REMOVE PatientReligiousPreference YES
+KEEP PatientSexNeutered YES
+REMOVE ResponsiblePerson YES
+REMOVE ResponsibleOrganization YES
+REMOVE PatientComments YES
+#REPLACE ClinicalTrialSponsorName var:TRIALSPONSOR
+#REPLACE ClinicalTrialSiteID var:SITEID
+#REPLACE ClinicalTrialSiteName var:SITENAME
+ADD PatientIdentityRemoved YES
+ADD 00120063 var:custom_tag_value_00120063
+#ADD BlockOwner CTP
+#REPLACE ProjectName var:PROJECTNAME
+#REPLACE TrialName var:TRIALNAME
+#REPLACE SiteName var:SITENAME
+#REPLACE SiteID var:SITEID
+REMOVE ContrastBolusAgent YES
+KEEP BodyPartExamined YES
+KEEP DeviceSerialNumber YES
+KEEP DeviceUID YES
+KEEP PlateID YES
+KEEP GeneratorID YES
+KEEP CassetteID YES
+KEEP GantryID YES
+JITTER DateOfSecondaryCapture var:DATEINC
+KEEP SoftwareVersion YES
+REMOVE ProtocolName YES
+JITTER RadiopharmaceuticalStartTime var:DATEINC
+JITTER RadiopharmaceuticalStopTime var:DATEINC
+REPLACE DateOfLastCalibration func:jitter_timestamp_array
+REMOVE AcquisitionDeviceProcessingDescription YES
+REMOVE AcquisitionComments YES
+KEEP DetectorID YES
+JITTER DateOfLastDetectorCalibration var:DATEINC
+REMOVE AcquisitionProtocolDescription YES
+REMOVE ContributionDescription YES
+REPLACE StudyInstanceUID func:hashuid
+REPLACE SeriesInstanceUID func:hashuid
+BLANK StudyID YES
+REPLACE FrameOfReferenceUID func:hashuid
+REPLACE SynchronizationFrameOfReferenceUID func:hashuid
+REMOVE ModifyingDeviceID YES
+REMOVE ModifyingDeviceManufacturer YES
+REMOVE ModifiedImageDescription YES
+REMOVE ImageComments YES
+REMOVE FrameComments YES
+REPLACE ConcatenationUID func:hashuid
+REPLACE DimensionOrganizationUID func:hashuid
+KEEP BurnedInAnnotation YES
+ADD LongitudinalTemporalInformationModified var:custom_tag_value_00280303
+REPLACE PaletteColorLUTUID func:hashuid
+REPLACE LargePaletteColorLUTUid func:hashuid
+REMOVE ImagePresentationComments YES
+REMOVE StudyIDIssuer YES
+REMOVE StudyVerifiedDate YES
+REMOVE StudyVerifiedTime YES
+REMOVE StudyReadDate YES
+REMOVE StudyReadTime YES
+JITTER ScheduledStudyStartDate var:DATEINC
+KEEP ScheduledStudyStartTime YES
+JITTER ScheduledStudyStopDate var:DATEINC
+KEEP ScheduledStudyStopTime YES
+REMOVE ScheduledStudyLocation YES
+REMOVE ScheduledStudyLocationAET YES
+REMOVE ReasonforStudy YES
+REMOVE RequestingPhysician YES
+REMOVE RequestingService YES
+JITTER StudyArrivalDate var:DATEINC
+JITTER StudyCompletionDate var:DATEINC
+REMOVE RequestedProcedureDescription YES
+REMOVE RequestedContrastAgent YES
+REMOVE StudyComments YES
+REMOVE RefPatientAliasSeq YES
+REMOVE AdmissionID YES
+REMOVE IssuerOfAdmissionID YES
+REMOVE ScheduledAdmissionDate YES
+REMOVE ScheduledAdmissionTime YES
+REMOVE ScheduledDischargeDate YES
+REMOVE ScheduledDischargeTime YES
+REMOVE ScheduledPatientInstitutionResidence YES
+JITTER AdmittingDate var:DATEINC
+KEEP AdmittingTime YES
+JITTER DischargeDate var:DATEINC
+KEEP DischargeTime YES
+REMOVE DischargeDiagnosisDescription YES
+REMOVE SpecialNeeds YES
+REMOVE ServiceEpisodeID YES
+REMOVE IssuerOfServiceEpisodeId YES
+REMOVE ServiceEpisodeDescription YES
+REMOVE CurrentPatientLocation YES
+REMOVE PatientInstitutionResidence YES
+REMOVE PatientState YES
+#REMOVE ReferencedPatientAliasSeq YES
+REMOVE VisitComments YES
+REMOVE ScheduledStationAET YES
+JITTER SPSStartDate var:DATEINC
+KEEP SPSStartTime YES
+JITTER SPSEndDate var:DATEINC
+KEEP SPSEndTime YES
+REMOVE ScheduledPerformingPhysicianName YES
+REMOVE SPSDescription YES
+REMOVE YES
+REMOVE ScheduledStationName YES
+REMOVE SPSLocation YES
+REMOVE PreMedication YES
+REMOVE PerformedStationAET YES
+REMOVE PerformedStationName YES
+REMOVE PerformedLocation YES
+JITTER PPSStartDate var:DATEINC
+KEEP PPSStartTime YES
+JITTER PPSEndDate var:DATEINC
+REMOVE PPSID YES
+REMOVE PPSDescription YES
+REMOVE RequestAttributesSeq YES
+REMOVE PPSComments YES
+REMOVE AcquisitionContextSeq YES
+REMOVE RequestedProcedureID YES
+REMOVE PatientTransportArrangements YES
+REMOVE RequestedProcedureLocation YES
+REMOVE NamesOfIntendedRecipientsOfResults YES
+REMOVE IntendedRecipientsOfResultsIDSequence YES
+REMOVE PersonIdCodeSequence YES
+REMOVE PersonAddress YES
+REMOVE PersonTelephoneNumbers YES
+REMOVE RequestedProcedureComments YES
+REMOVE ReasonForTheImagingServiceRequest YES
+REMOVE IssueDateOfImagingServiceRequest YES
+REMOVE IssueTimeOfImagingServiceRequest YES
+REMOVE OrderEnteredBy YES
+REMOVE OrderEntererLocation YES
+REMOVE OrderCallbackPhoneNumber YES
+BLANK PlacerOrderNumber YES
+BLANK FillerOrderNumber YES
+REMOVE ImagingServiceRequestComments YES
+REMOVE ConfidentialityPatientData YES
+REPLACE RefGenPurposeSchedProcStepTransUID func:hashuid
+REMOVE ScheduledStationNameCodeSeq YES
+REMOVE ScheduledStationGeographicLocCodeSeq YES
+REMOVE PerformedStationNameCodeSeq YES
+REMOVE PerformedStationGeoLocCodeSeq YES
+REMOVE ScheduledHumanPerformersSeq YES
+REMOVE ActualHumanPerformersSequence YES
+REMOVE HumanPerformersOrganization YES
+REMOVE HumanPerformersName YES
+REMOVE VerifyingOrganization YES
+REMOVE VerificationDateTime YES
+REMOVE ObservationDateTime YES
+REMOVE VerifyingObserverSeq YES
+BLANK VerifyingObserverName YES
+REMOVE AuthorObserverSequence YES
+REMOVE ParticipantSequence YES
+REMOVE CustodialOrganizationSeq YES
+REMOVE VerifyingObserverIdentificationCodeSeq YES
+REMOVE DateTime YES
+REMOVE Date YES
+REMOVE Time YES
+BLANK PersonName YES
+REPLACE UID func:hashuid
+REMOVE RefDatetime YES
+#KEEP ContentTemplateSeq YES
+REMOVE ContentSeq YES
+REPLACE TemplateExtensionOrganizationUID func:hashuid
+REPLACE TemplateExtensionCreatorUID func:hashuid
+ADD 00540016 var:custom_tag_value_00540016
+REMOVE OverlayData YES
+REMOVE OverlayComments YES
+REMOVE GraphicAnnotationSequence YES
+BLANK ContentCreatorsName YES
+REMOVE ContentCreatorsIdCodeSeq YES
+REPLACE FiducialUID func:hashuid
+REPLACE StorageMediaFilesetUID func:hashuid
+REMOVE IconImageSequence YES
+REMOVE TopicTitle YES
+REMOVE TopicSubject YES
+REMOVE TopicAuthor YES
+REMOVE TopicKeyWords YES
+REMOVE DigitalSignatureUID YES
+REMOVE RefDigitalSignatureSeq YES
+REMOVE RefSOPInstanceMACSeq YES
+REMOVE MAC YES
+REMOVE ModifiedAttributesSequence YES
+REMOVE OriginalAttributesSequence YES
+REMOVE TextString YES
+JITTER StructureSetDate var:DATEINC
+REPLACE ReferencedFrameOfReferenceUID func:hashuid
+REPLACE RelatedFrameOfReferenceUID func:hashuid
+REPLACE DoseReferenceUID func:hashuid
+REMOVE ReviewerName YES
+REMOVE Arbitrary YES
+REMOVE TextComments YES
+REMOVE ResultsIDIssuer YES
+REMOVE InterpretationRecorder YES
+REMOVE InterpretationTranscriber YES
+REMOVE InterpretationText YES
+REMOVE InterpretationAuthor YES
+REMOVE InterpretationApproverSequence YES
+REMOVE PhysicianApprovingInterpretation YES
+REMOVE InterpretationDiagnosisDescription YES
+REMOVE ResultsDistributionListSeq YES
+REMOVE DistributionName YES
+REMOVE DistributionAddress YES
+REMOVE InterpretationIdIssuer YES
+REMOVE Impressions YES
+REMOVE ResultComments YES
+REMOVE DigitalSignaturesSeq YES
+REMOVE DataSetTrailingPadding YES
