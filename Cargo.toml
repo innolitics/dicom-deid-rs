@@ -1,8 +1,7 @@
 [package]
 name = "dicom-deid-rs"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
+edition = "2024"
+version = "0.1.0"
 
 [[bin]]
 name = "dicom-deid-rs"
@@ -10,10 +9,10 @@ path = "src/main.rs"
 required-features = ["pipeline"]
 
 [dependencies]
-dicom-object.workspace = true
-dicom-core.workspace = true
-dicom-dictionary-std.workspace = true
-dicom-pixeldata = { workspace = true }
+dicom-object = "0.9"
+dicom-core = "0.9"
+dicom-dictionary-std = "0.9"
+dicom-pixeldata = "0.9"
 sha2 = "0.10"
 regex = "1"
 thiserror = "2"
