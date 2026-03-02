@@ -1,7 +1,8 @@
 [package]
 name = "dicom-deid-rs"
-version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "dicom-deid-rs"
@@ -9,19 +10,21 @@ path = "src/main.rs"
 required-features = ["pipeline"]
 
 [dependencies]
-dicom-object = "0.8"
-dicom-core = "0.8"
-dicom-dictionary-std = "0.8"
-dicom-pixeldata = { version = "0.8", default-features = false, features = ["native"] }
+dicom-object.workspace = true
+dicom-core.workspace = true
+dicom-dictionary-std.workspace = true
+dicom-pixeldata = { workspace = true }
 sha2 = "0.10"
 regex = "1"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 indicatif = { version = "0.17", optional = true }
+rayon = { version = "1", optional = true }
 
 [features]
 default = ["pipeline", "jpeg2000"]
 pipeline = ["dep:indicatif"]
+parallel = ["dep:rayon"]
 jpeg2000 = ["dicom-pixeldata/openjp2"]
 
 [dev-dependencies]

@@ -11,6 +11,9 @@ use dicom_object::InMemDicomObject;
 use std::collections::HashMap;
 
 /// A function that can be referenced via `func:<name>` in a recipe.
+#[cfg(feature = "parallel")]
+pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError> + Send + Sync>;
+#[cfg(not(feature = "parallel"))]
 pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError>>;
 
 /// Apply the given header actions to a DICOM object.

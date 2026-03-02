@@ -10,6 +10,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "parallel")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Configuration for the de-identification pipeline.
 pub struct DeidConfig {
@@ -34,7 +36,7 @@ pub struct DeidPipeline {
     filter_index: FilterIndex,
 }
 
-enum FileOutcome {
+pub enum FileOutcome {
     Processed,
     Blacklisted(String),
 }
@@ -48,7 +50,22 @@ impl DeidPipeline {
     pub fn new(mut config: DeidConfig) -> Result<Self, DeidError> {
         let recipe_text = fs::read_to_string(&config.recipe_path)?;
         let recipe = Recipe::parse(&recipe_text)?;
-        // Merge built-in functions; user-supplied functions override defaults.
+        let mut merged = functions::default_functions();
+        for (name, func) in config.functions.drain() {
+            merged.insert(name, func);
+        }
+        config.functions = merged;
+        let filter_index = FilterIndex::new(&recipe);
+        Ok(DeidPipeline {
+            config,
+            recipe,
+            filter_index,
+        })
+    }
+
+    /// Create a new pipeline from recipe text directly (avoids temp files).
+    pub fn from_recipe_text(recipe_text: &str, mut config: DeidConfig) -> Result<Self, DeidError> {
+        let recipe = Recipe::parse(recipe_text)?;
         let mut merged = functions::default_functions();
         for (name, func) in config.functions.drain() {
             merged.insert(name, func);
@@ -113,7 +130,7 @@ impl DeidPipeline {
         Ok(report)
     }
 
-    fn process_file(&self, file_path: &Path) -> Result<FileOutcome, DeidError> {
+    pub fn process_file(&self, file_path: &Path) -> Result<FileOutcome, DeidError> {
         let mut obj = open_file(file_path).map_err(|e| {
             DeidError::Dicom(format!("failed to open {}: {}", file_path.display(), e))
         })?;
@@ -154,6 +171,112 @@ impl DeidPipeline {
         })?;
 
         Ok(FileOutcome::Processed)
+    }
+
+    /// Run the pipeline with a progress callback instead of a progress bar.
+    pub fn run_with_progress(
+        &self,
+        on_progress: impl Fn(usize, usize, usize),
+    ) -> Result<DeidReport, DeidError> {
+        let files = Self::find_dicom_files(&self.config.input_dir)?;
+        let mut report = DeidReport {
+            files_processed: 0,
+            files_skipped: 0,
+            files_blacklisted: 0,
+        };
+        let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
+
+        for file_path in &files {
+            match self.process_file(file_path) {
+                Ok(FileOutcome::Processed) => report.files_processed += 1,
+                Ok(FileOutcome::Blacklisted(reason)) => {
+                    let relative = file_path
+                        .strip_prefix(&self.config.input_dir)
+                        .unwrap_or(file_path);
+                    blacklisted_files.push((relative.to_path_buf(), reason));
+                    report.files_blacklisted += 1;
+                }
+                Err(e) => {
+                    eprintln!("Warning: skipping {}: {}", file_path.display(), e);
+                    report.files_skipped += 1;
+                }
+            }
+            on_progress(
+                report.files_processed,
+                report.files_blacklisted,
+                report.files_skipped,
+            );
+        }
+
+        if !blacklisted_files.is_empty() {
+            self.write_blacklist_report(&blacklisted_files)?;
+        }
+
+        Ok(report)
+    }
+
+    /// Run the pipeline using parallel file processing via rayon.
+    #[cfg(feature = "parallel")]
+    pub fn run_parallel(
+        &self,
+        num_threads: usize,
+        on_progress: impl Fn(usize, usize, usize) + Send + Sync,
+    ) -> Result<DeidReport, DeidError> {
+        use rayon::prelude::*;
+
+        let files = Self::find_dicom_files(&self.config.input_dir)?;
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| DeidError::Io(std::io::Error::other(e)))?;
+
+        let processed = AtomicUsize::new(0);
+        let blacklisted_count = AtomicUsize::new(0);
+        let skipped = AtomicUsize::new(0);
+
+        let blacklisted_files: std::sync::Mutex<Vec<(PathBuf, String)>> =
+            std::sync::Mutex::new(Vec::new());
+
+        pool.install(|| {
+            files.par_iter().for_each(|file_path| {
+                match self.process_file(file_path) {
+                    Ok(FileOutcome::Processed) => {
+                        processed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(FileOutcome::Blacklisted(reason)) => {
+                        let relative = file_path
+                            .strip_prefix(&self.config.input_dir)
+                            .unwrap_or(file_path);
+                        blacklisted_files
+                            .lock()
+                            .unwrap()
+                            .push((relative.to_path_buf(), reason));
+                        blacklisted_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: skipping {}: {}", file_path.display(), e);
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                on_progress(
+                    processed.load(Ordering::Relaxed),
+                    blacklisted_count.load(Ordering::Relaxed),
+                    skipped.load(Ordering::Relaxed),
+                );
+            });
+        });
+
+        let blacklisted_files = blacklisted_files.into_inner().unwrap();
+        if !blacklisted_files.is_empty() {
+            self.write_blacklist_report(&blacklisted_files)?;
+        }
+
+        Ok(DeidReport {
+            files_processed: processed.into_inner(),
+            files_skipped: skipped.into_inner(),
+            files_blacklisted: blacklisted_count.into_inner(),
+        })
     }
 
     fn write_blacklist_report(&self, blacklisted: &[(PathBuf, String)]) -> Result<(), DeidError> {
@@ -334,17 +457,11 @@ mod tests {
     /// Requirement r-6-1
     #[test]
     fn r6_1_library_api_is_accessible() {
-        // Verify that the core library types can be constructed and used
-        // programmatically, confirming the software is designed as a library.
-        use crate::filter::{evaluate_conditions, is_blacklisted};
-        use crate::metadata::apply_header_actions;
-        use crate::pixel::apply_pixel_mask;
         use crate::recipe::{
-            ActionType, ActionValue, Condition, CoordinateRegion, FilterLabel, FilterSection,
-            FilterType, HeaderAction, LogicalOp, Predicate, Recipe, TagSpecifier,
+            ActionType, ActionValue, Condition, FilterLabel, FilterSection, FilterType,
+            HeaderAction, LogicalOp, Predicate, Recipe, TagSpecifier,
         };
 
-        // Construct a recipe programmatically
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![HeaderAction {
@@ -367,9 +484,129 @@ mod tests {
             }],
         };
 
-        // The types compile and can be inspected
         assert_eq!(recipe.format, "dicom");
         assert_eq!(recipe.header.len(), 1);
         assert_eq!(recipe.filters.len(), 1);
+    }
+
+    // -- r-1-3 (parallel) ----------------------------------------------------
+
+    /// Requirement r-1-3: run_parallel produces same results as sequential run
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn r1_3_run_parallel_produces_same_results() {
+        use crate::test_helpers::*;
+
+        let tmp = TempDir::new().expect("should create temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        for i in 0..5 {
+            let mut file_obj = create_test_file_obj();
+            put_str(
+                &mut file_obj,
+                dicom_dictionary_std::tags::PATIENT_NAME,
+                dicom_core::VR::PN,
+                &format!("Patient^{}", i),
+            );
+            put_str(
+                &mut file_obj,
+                dicom_dictionary_std::tags::MODALITY,
+                dicom_core::VR::CS,
+                "CT",
+            );
+            file_obj
+                .write_to_file(input_dir.join(format!("test_{}.dcm", i)))
+                .expect("write test DICOM file");
+        }
+
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(
+            &recipe_path,
+            "FORMAT dicom\n%header\nREPLACE PatientName ANON\n",
+        )
+        .expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir: input_dir.clone(),
+            output_dir: output_dir.clone(),
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("should create pipeline");
+        let report = pipeline
+            .run_parallel(2, |_, _, _| {})
+            .expect("should run parallel pipeline");
+
+        assert_eq!(report.files_processed, 5);
+        assert_eq!(report.files_skipped, 0);
+        assert_eq!(report.files_blacklisted, 0);
+
+        for i in 0..5 {
+            let output_file = output_dir.join(format!("test_{}.dcm", i));
+            assert!(output_file.exists(), "output file {} should exist", i);
+            let result_obj = open_file(&output_file).expect("should open output");
+            let name = result_obj
+                .element_by_name("PatientName")
+                .expect("should have PatientName");
+            let val = name.value().to_str().expect("should read value");
+            assert_eq!(val.as_ref(), "ANON");
+        }
+    }
+
+    /// from_recipe_text avoids needing a recipe file on disk
+    #[test]
+    fn from_recipe_text_works() {
+        use crate::test_helpers::*;
+
+        let tmp = TempDir::new().expect("should create temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        let mut file_obj = create_test_file_obj();
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_NAME,
+            dicom_core::VR::PN,
+            "John^Doe",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::MODALITY,
+            dicom_core::VR::CS,
+            "CT",
+        );
+        file_obj
+            .write_to_file(input_dir.join("test.dcm"))
+            .expect("write test DICOM file");
+
+        let recipe_text = "FORMAT dicom\n%header\nREPLACE PatientName ANON\n";
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path: PathBuf::new(),
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+        };
+
+        let pipeline =
+            DeidPipeline::from_recipe_text(recipe_text, config).expect("should create pipeline");
+        let report = pipeline.run_with_progress(|_, _, _| {});
+        assert!(report.is_ok());
+        let report = report.unwrap();
+        assert_eq!(report.files_processed, 1);
+
+        let result_obj = open_file(output_dir.join("test.dcm")).expect("should open output");
+        let val = result_obj
+            .element_by_name("PatientName")
+            .expect("should have PatientName")
+            .value()
+            .to_str()
+            .expect("should read value");
+        assert_eq!(val.as_ref(), "ANON");
     }
 }
