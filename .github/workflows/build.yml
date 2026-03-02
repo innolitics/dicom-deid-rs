@@ -1,0 +1,65 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: dicom-deid-rs
+            asset: dicom-deid-rs-linux-x86_64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: dicom-deid-rs
+            asset: dicom-deid-rs-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: dicom-deid-rs
+            asset: dicom-deid-rs-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: dicom-deid-rs.exe
+            asset: dicom-deid-rs-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+
+  build-wasm:
+    name: Build (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-unknown-unknown
+      - name: Build
+        run: cargo build --lib --release --target wasm32-unknown-unknown --no-default-features --features jpeg2000
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dicom-deid-rs-wasm
+          path: target/wasm32-unknown-unknown/release/dicom_deid_rs.wasm
