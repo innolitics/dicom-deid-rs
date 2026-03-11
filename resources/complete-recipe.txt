@@ -865,8 +865,8 @@ REPLACE AccessionNumber func:hashuid
 REPLACE UID func:hashuid
 
 # --- REPLACE with var: references --------------------------------------------
-REPLACE PatientID var:PATIENT_ID
-REPLACE PatientName var:PATIENT_NAME
+REPLACE PatientID func:hashuid
+REPLACE PatientName func:hashuid
 
 # --- REPLACE with literal values (using different tag formats) ---------------
 REPLACE StudyID ANONYMIZED
