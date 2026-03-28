@@ -1,3 +1,4 @@
+use dicom_deid_rs::functions::create_lookup_function;
 use dicom_deid_rs::pipeline::{DeidConfig, DeidPipeline};
 use std::collections::HashMap;
 use std::env;
@@ -6,12 +7,13 @@ use std::process;
 
 fn print_usage(program: &str) {
     eprintln!(
-        "Usage: {} <input_dir> <output_dir> <recipe_file> [--var NAME VALUE]...",
+        "Usage: {} <input_dir> <output_dir> <recipe_file> [--var NAME VALUE]... [--lookup-table PATH]",
         program
     );
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --var NAME VALUE   Define a recipe variable (can be repeated)");
+    eprintln!("  --var NAME VALUE     Define a recipe variable (can be repeated)");
+    eprintln!("  --lookup-table PATH  Load a CTP-format lookup table for func:lookup");
 }
 
 fn main() {
@@ -22,20 +24,48 @@ fn main() {
     }
 
     let mut variables: HashMap<String, String> = HashMap::new();
+    let mut lookup_table_path: Option<PathBuf> = None;
     let mut i = 4;
     while i < args.len() {
-        if args[i] == "--var" {
-            if i + 2 >= args.len() {
-                eprintln!("Error: --var requires NAME and VALUE arguments");
+        match args[i].as_str() {
+            "--var" => {
+                if i + 2 >= args.len() {
+                    eprintln!("Error: --var requires NAME and VALUE arguments");
+                    print_usage(&args[0]);
+                    process::exit(1);
+                }
+                variables.insert(args[i + 1].clone(), args[i + 2].clone());
+                i += 3;
+            }
+            "--lookup-table" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --lookup-table requires a PATH argument");
+                    print_usage(&args[0]);
+                    process::exit(1);
+                }
+                lookup_table_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            _ => {
+                eprintln!("Error: unknown argument '{}'", args[i]);
                 print_usage(&args[0]);
                 process::exit(1);
             }
-            variables.insert(args[i + 1].clone(), args[i + 2].clone());
-            i += 3;
-        } else {
-            eprintln!("Error: unknown argument '{}'", args[i]);
-            print_usage(&args[0]);
-            process::exit(1);
+        }
+    }
+
+    let mut functions = HashMap::new();
+    if let Some(ref table_path) = lookup_table_path {
+        match create_lookup_function(table_path) {
+            Ok(lookup_fns) => {
+                for (name, func) in lookup_fns {
+                    functions.insert(name, func);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error loading lookup table: {}", e);
+                process::exit(1);
+            }
         }
     }
 
@@ -44,7 +74,7 @@ fn main() {
         output_dir: PathBuf::from(&args[2]),
         recipe_path: PathBuf::from(&args[3]),
         variables,
-        functions: HashMap::new(),
+        functions,
     };
 
     let pipeline = match DeidPipeline::new(config) {

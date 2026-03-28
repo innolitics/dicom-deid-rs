@@ -49,6 +49,18 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             };
             field_val.to_lowercase() != value.to_lowercase()
         }
+        Predicate::StartsWith { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return false;
+            };
+            field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::NotStartsWith { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return true;
+            };
+            !field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
         Predicate::Missing { field } => obj.element_by_name(field).is_err(),
         Predicate::Empty { field } => match obj.element_by_name(field) {
             Ok(elem) => match elem.value() {
@@ -103,6 +115,7 @@ pub fn is_blacklisted(recipe: &Recipe, obj: &InMemDicomObject) -> bool {
 /// Return the name of the first matching blacklist label, or `None` if no
 /// blacklist filter matches.
 pub fn blacklist_reason<'a>(recipe: &'a Recipe, obj: &InMemDicomObject) -> Option<&'a str> {
+    // Check explicit blacklist sections
     for section in &recipe.filters {
         if section.filter_type != FilterType::Blacklist {
             continue;
@@ -113,6 +126,22 @@ pub fn blacklist_reason<'a>(recipe: &'a Recipe, obj: &InMemDicomObject) -> Optio
             }
         }
     }
+
+    // Check whitelist sections: file must match at least one whitelist label
+    let has_whitelist = recipe
+        .filters
+        .iter()
+        .any(|s| s.filter_type == FilterType::Whitelist);
+    if has_whitelist {
+        let matches_any_whitelist = recipe.filters.iter().any(|section| {
+            section.filter_type == FilterType::Whitelist
+                && section.labels.iter().any(|label| matches_label(label, obj))
+        });
+        if !matches_any_whitelist {
+            return Some("whitelist_rejected");
+        }
+    }
+
     None
 }
 

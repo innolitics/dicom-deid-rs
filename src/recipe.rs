@@ -22,6 +22,7 @@ pub struct FilterSection {
 pub enum FilterType {
     Graylist,
     Blacklist,
+    Whitelist,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +54,8 @@ pub enum Predicate {
     NotContains { field: String, value: String },
     Equals { field: String, value: String },
     NotEquals { field: String, value: String },
+    StartsWith { field: String, value: String },
+    NotStartsWith { field: String, value: String },
     Missing { field: String },
     Empty { field: String },
     Present { field: String },
@@ -108,8 +111,10 @@ pub enum TagSpecifier {
 // ---------------------------------------------------------------------------
 
 const PREDICATE_KEYWORDS: &[&str] = &[
+    "notstartswith",
     "notcontains",
     "notequals",
+    "startswith",
     "contains",
     "equals",
     "missing",
@@ -299,6 +304,7 @@ fn parse_filter_type(s: &str) -> Result<FilterType, DeidError> {
     match s {
         "graylist" => Ok(FilterType::Graylist),
         "blacklist" => Ok(FilterType::Blacklist),
+        "whitelist" => Ok(FilterType::Whitelist),
         _ => Err(DeidError::RecipeParse(format!(
             "unknown filter type: {}",
             s
@@ -468,15 +474,21 @@ fn split_inline_operators(content: &str) -> Vec<(LogicalOp, String)> {
 
 fn parse_predicate(text: &str) -> Result<Predicate, DeidError> {
     // Check longer keywords first to avoid prefix conflicts
-    if let Some(rest) = text.strip_prefix("notcontains ") {
+    if let Some(rest) = text.strip_prefix("notstartswith ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::NotStartsWith { field, value })
+    } else if let Some(rest) = text.strip_prefix("notcontains ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::NotContains { field, value })
-    } else if let Some(rest) = text.strip_prefix("contains ") {
-        let (field, value) = split_field_value(rest.trim())?;
-        Ok(Predicate::Contains { field, value })
     } else if let Some(rest) = text.strip_prefix("notequals ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::NotEquals { field, value })
+    } else if let Some(rest) = text.strip_prefix("startswith ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::StartsWith { field, value })
+    } else if let Some(rest) = text.strip_prefix("contains ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::Contains { field, value })
     } else if let Some(rest) = text.strip_prefix("equals ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::Equals { field, value })
