@@ -114,7 +114,9 @@ impl DeidPipeline {
                     report.files_blacklisted += 1;
                 }
                 Err(e) => {
-                    pb.println(format!("Warning: skipping {}: {}", file_path.display(), e));
+                    let msg = format!("Warning: skipping {}: {}", file_path.display(), e);
+                    pb.println(&msg);
+                    eprintln!("{}", msg);
                     report.files_skipped += 1;
                 }
             }
@@ -206,6 +208,7 @@ impl DeidPipeline {
                 report.files_blacklisted,
                 report.files_skipped,
             );
+
         }
 
         if !blacklisted_files.is_empty() {
