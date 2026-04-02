@@ -576,9 +576,9 @@ fn parse_tag_specifier(s: &str) -> Result<TagSpecifier, DeidError> {
 
         // Check for group range syntax: (GGGG-GGGG,*) or (GGGG-GGGG,EEEE)
         if group_str.contains('-') {
-            let (min_str, max_str) = group_str
-                .split_once('-')
-                .ok_or_else(|| DeidError::RecipeParse(format!("invalid group range: {}", group_str)))?;
+            let (min_str, max_str) = group_str.split_once('-').ok_or_else(|| {
+                DeidError::RecipeParse(format!("invalid group range: {}", group_str))
+            })?;
             let group_min = u16::from_str_radix(min_str.trim(), 16)
                 .map_err(|_| DeidError::RecipeParse(format!("invalid range start: {}", min_str)))?;
             let group_max = u16::from_str_radix(max_str.trim(), 16)
@@ -586,10 +586,15 @@ fn parse_tag_specifier(s: &str) -> Result<TagSpecifier, DeidError> {
             let element = if elem_str == "*" {
                 None
             } else {
-                Some(u16::from_str_radix(elem_str, 16)
-                    .map_err(|_| DeidError::RecipeParse(format!("invalid tag element: {}", elem_str)))?)
+                Some(u16::from_str_radix(elem_str, 16).map_err(|_| {
+                    DeidError::RecipeParse(format!("invalid tag element: {}", elem_str))
+                })?)
             };
-            return Ok(TagSpecifier::GroupRange { group_min, group_max, element });
+            return Ok(TagSpecifier::GroupRange {
+                group_min,
+                group_max,
+                element,
+            });
         }
 
         // (GGGG,EEEE) format

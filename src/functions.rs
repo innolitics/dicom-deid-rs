@@ -96,7 +96,11 @@ pub fn create_lookup_function(
     let content = fs::read_to_string(table_path).map_err(|e| {
         DeidError::Io(std::io::Error::new(
             e.kind(),
-            format!("failed to read lookup table {}: {}", table_path.display(), e),
+            format!(
+                "failed to read lookup table {}: {}",
+                table_path.display(),
+                e
+            ),
         ))
     })?;
 

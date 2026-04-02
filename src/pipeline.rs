@@ -214,7 +214,6 @@ impl DeidPipeline {
                 report.files_blacklisted,
                 report.files_skipped,
             );
-
         }
 
         if !blacklisted_files.is_empty() {

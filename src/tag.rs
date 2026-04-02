@@ -271,7 +271,10 @@ mod tests {
         let matched = resolve_tags(&spec, &obj).expect("should resolve");
         assert!(matched.contains(&Tag(0x5000, 0x3000)));
         assert!(matched.contains(&Tag(0x5002, 0x3000)));
-        assert!(!matched.contains(&Tag(0x5000, 0x0010)), "non-matching element should be excluded");
+        assert!(
+            !matched.contains(&Tag(0x5000, 0x0010)),
+            "non-matching element should be excluded"
+        );
     }
 
     #[test]
