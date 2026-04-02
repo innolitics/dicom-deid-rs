@@ -99,6 +99,14 @@ pub enum TagSpecifier {
     Keyword(String),
     TagValue(Tag),
     Pattern(String),
+    /// Match all tags whose group is in [group_min, group_max] (inclusive).
+    /// When `element` is `Some`, only that element number matches;
+    /// when `None`, every element in the matching groups matches (wildcard).
+    GroupRange {
+        group_min: u16,
+        group_max: u16,
+        element: Option<u16>,
+    },
     PrivateTag {
         group: u16,
         creator: String,
@@ -559,14 +567,35 @@ fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
 
 fn parse_tag_specifier(s: &str) -> Result<TagSpecifier, DeidError> {
     if s.starts_with('(') && s.ends_with(')') {
-        // (GGGG,EEEE) format
         let inner = &s[1..s.len() - 1];
         let (group_str, elem_str) = inner
             .split_once(',')
             .ok_or_else(|| DeidError::RecipeParse(format!("invalid tag format: {}", s)))?;
-        let group = u16::from_str_radix(group_str.trim(), 16)
+        let group_str = group_str.trim();
+        let elem_str = elem_str.trim();
+
+        // Check for group range syntax: (GGGG-GGGG,*) or (GGGG-GGGG,EEEE)
+        if group_str.contains('-') {
+            let (min_str, max_str) = group_str
+                .split_once('-')
+                .ok_or_else(|| DeidError::RecipeParse(format!("invalid group range: {}", group_str)))?;
+            let group_min = u16::from_str_radix(min_str.trim(), 16)
+                .map_err(|_| DeidError::RecipeParse(format!("invalid range start: {}", min_str)))?;
+            let group_max = u16::from_str_radix(max_str.trim(), 16)
+                .map_err(|_| DeidError::RecipeParse(format!("invalid range end: {}", max_str)))?;
+            let element = if elem_str == "*" {
+                None
+            } else {
+                Some(u16::from_str_radix(elem_str, 16)
+                    .map_err(|_| DeidError::RecipeParse(format!("invalid tag element: {}", elem_str)))?)
+            };
+            return Ok(TagSpecifier::GroupRange { group_min, group_max, element });
+        }
+
+        // (GGGG,EEEE) format
+        let group = u16::from_str_radix(group_str, 16)
             .map_err(|_| DeidError::RecipeParse(format!("invalid tag group: {}", group_str)))?;
-        let element = u16::from_str_radix(elem_str.trim(), 16)
+        let element = u16::from_str_radix(elem_str, 16)
             .map_err(|_| DeidError::RecipeParse(format!("invalid tag element: {}", elem_str)))?;
         Ok(TagSpecifier::TagValue(Tag(group, element)))
     } else if s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1282,5 +1311,55 @@ missing Modality
 ";
         let recipe = Recipe::parse(input).expect("should parse");
         assert_eq!(recipe.filters[0].filter_type, FilterType::Blacklist);
+    }
+
+    // -- group range tag specifier -------------------------------------------
+
+    #[test]
+    fn parse_group_range_wildcard_element() {
+        let spec = parse_tag_specifier("(6000-601e,*)").expect("should parse");
+        assert_eq!(
+            spec,
+            TagSpecifier::GroupRange {
+                group_min: 0x6000,
+                group_max: 0x601e,
+                element: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_group_range_specific_element() {
+        let spec = parse_tag_specifier("(5000-501e,3000)").expect("should parse");
+        assert_eq!(
+            spec,
+            TagSpecifier::GroupRange {
+                group_min: 0x5000,
+                group_max: 0x501e,
+                element: Some(0x3000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_group_range_in_header_action() {
+        let input = "\
+FORMAT dicom
+
+%header
+
+REMOVE (6000-601e,*)
+";
+        let recipe = Recipe::parse(input).expect("should parse");
+        assert_eq!(recipe.header.len(), 1);
+        assert_eq!(recipe.header[0].action_type, ActionType::Remove);
+        assert_eq!(
+            recipe.header[0].tag,
+            TagSpecifier::GroupRange {
+                group_min: 0x6000,
+                group_max: 0x601e,
+                element: None,
+            }
+        );
     }
 }

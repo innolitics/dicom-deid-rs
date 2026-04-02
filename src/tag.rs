@@ -72,6 +72,23 @@ pub fn resolve_tags(
             }
             Ok(matched)
         }
+        TagSpecifier::GroupRange {
+            group_min,
+            group_max,
+            element,
+        } => {
+            let mut matched = Vec::new();
+            for elem in obj.iter() {
+                let tag = elem.tag();
+                if tag.group() >= *group_min && tag.group() <= *group_max {
+                    match element {
+                        Some(e) if tag.element() != *e => continue,
+                        _ => matched.push(tag),
+                    }
+                }
+            }
+            Ok(matched)
+        }
         TagSpecifier::PrivateTag {
             group,
             creator,
@@ -213,5 +230,59 @@ mod tests {
         let matched = resolve_tags(&spec, &obj).expect("should resolve");
         assert!(matched.contains(&tags::PATIENT_NAME));
         assert!(matched.contains(&tags::PATIENT_ID));
+    }
+
+    // -- group range ---------------------------------------------------------
+
+    #[test]
+    fn group_range_wildcard_matches_all_elements() {
+        let mut obj = create_test_obj();
+        // Insert tags in the 6000 group (overlay tags)
+        put_str(&mut obj, Tag(0x6000, 0x0010), VR::US, "512");
+        put_str(&mut obj, Tag(0x6000, 0x3000), VR::OW, "data");
+        put_str(&mut obj, Tag(0x6002, 0x0010), VR::US, "256");
+        // A tag outside the range
+        put_str(&mut obj, Tag(0x0010, 0x0020), VR::LO, "12345");
+
+        let spec = TagSpecifier::GroupRange {
+            group_min: 0x6000,
+            group_max: 0x601e,
+            element: None,
+        };
+        let matched = resolve_tags(&spec, &obj).expect("should resolve");
+        assert!(matched.contains(&Tag(0x6000, 0x0010)));
+        assert!(matched.contains(&Tag(0x6000, 0x3000)));
+        assert!(matched.contains(&Tag(0x6002, 0x0010)));
+        assert!(!matched.contains(&Tag(0x0010, 0x0020)));
+    }
+
+    #[test]
+    fn group_range_specific_element_filters() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, Tag(0x5000, 0x3000), VR::OW, "curve1");
+        put_str(&mut obj, Tag(0x5002, 0x3000), VR::OW, "curve2");
+        put_str(&mut obj, Tag(0x5000, 0x0010), VR::US, "100");
+
+        let spec = TagSpecifier::GroupRange {
+            group_min: 0x5000,
+            group_max: 0x501e,
+            element: Some(0x3000),
+        };
+        let matched = resolve_tags(&spec, &obj).expect("should resolve");
+        assert!(matched.contains(&Tag(0x5000, 0x3000)));
+        assert!(matched.contains(&Tag(0x5002, 0x3000)));
+        assert!(!matched.contains(&Tag(0x5000, 0x0010)), "non-matching element should be excluded");
+    }
+
+    #[test]
+    fn group_range_empty_when_no_match() {
+        let obj = create_test_obj();
+        let spec = TagSpecifier::GroupRange {
+            group_min: 0x5000,
+            group_max: 0x501e,
+            element: None,
+        };
+        let matched = resolve_tags(&spec, &obj).expect("should resolve");
+        assert!(matched.is_empty());
     }
 }
