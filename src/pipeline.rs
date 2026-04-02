@@ -6,7 +6,7 @@ use crate::metadata::DeidFunction;
 use crate::pixel;
 use crate::recipe::Recipe;
 use dicom_core::dictionary::{DataDictionary as _, DataDictionaryEntry as _};
-use dicom_object::{open_file, InMemDicomObject};
+use dicom_object::{InMemDicomObject, open_file};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -311,8 +311,7 @@ impl DeidPipeline {
         let blacklisted_files: std::sync::Mutex<Vec<(PathBuf, String)>> =
             std::sync::Mutex::new(Vec::new());
 
-        let audit_entries: std::sync::Mutex<Vec<AuditEntry>> =
-            std::sync::Mutex::new(Vec::new());
+        let audit_entries: std::sync::Mutex<Vec<AuditEntry>> = std::sync::Mutex::new(Vec::new());
 
         pool.install(|| {
             files.par_iter().for_each(|file_path| {
@@ -387,8 +386,16 @@ impl DeidPipeline {
         let mut linker_rows: Vec<(&TagSnapshot, &TagSnapshot)> = Vec::new();
 
         for entry in entries {
-            let pre_uid = entry.pre.get("StudyInstanceUID").cloned().unwrap_or_default();
-            let post_uid = entry.post.get("StudyInstanceUID").cloned().unwrap_or_default();
+            let pre_uid = entry
+                .pre
+                .get("StudyInstanceUID")
+                .cloned()
+                .unwrap_or_default();
+            let post_uid = entry
+                .post
+                .get("StudyInstanceUID")
+                .cloned()
+                .unwrap_or_default();
 
             if seen_pre.insert(pre_uid) {
                 pre_rows.push(&entry.pre);
@@ -429,11 +436,23 @@ impl DeidPipeline {
                 csv_escape(pre.get("PatientID").map(|s| s.as_str()).unwrap_or("")),
                 csv_escape(pre.get("PatientName").map(|s| s.as_str()).unwrap_or("")),
                 csv_escape(pre.get("AccessionNumber").map(|s| s.as_str()).unwrap_or("")),
-                csv_escape(pre.get("StudyInstanceUID").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(
+                    pre.get("StudyInstanceUID")
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                ),
                 csv_escape(post.get("PatientID").map(|s| s.as_str()).unwrap_or("")),
                 csv_escape(post.get("PatientName").map(|s| s.as_str()).unwrap_or("")),
-                csv_escape(post.get("AccessionNumber").map(|s| s.as_str()).unwrap_or("")),
-                csv_escape(post.get("StudyInstanceUID").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(
+                    post.get("AccessionNumber")
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                ),
+                csv_escape(
+                    post.get("StudyInstanceUID")
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                ),
             )?;
         }
 
@@ -442,11 +461,7 @@ impl DeidPipeline {
 }
 
 /// Write a CSV file with the given tag columns from a list of snapshots.
-fn write_tag_csv(
-    path: &Path,
-    columns: &[&str],
-    rows: &[&TagSnapshot],
-) -> Result<(), DeidError> {
+fn write_tag_csv(path: &Path, columns: &[&str], rows: &[&TagSnapshot]) -> Result<(), DeidError> {
     let mut f = fs::File::create(path)?;
     writeln!(f, "{}", columns.join(","))?;
     for row in rows {
