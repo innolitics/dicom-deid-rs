@@ -5,10 +5,12 @@ use crate::metadata;
 use crate::metadata::DeidFunction;
 use crate::pixel;
 use crate::recipe::Recipe;
-use dicom_object::open_file;
+use dicom_core::dictionary::{DataDictionary as _, DataDictionaryEntry as _};
+use dicom_object::{open_file, InMemDicomObject};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "parallel")]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,8 +43,53 @@ pub struct DeidPipeline {
 }
 
 pub enum FileOutcome {
-    Processed,
+    Processed(AuditEntry),
     Blacklisted(String),
+}
+
+/// Tags extracted for audit logging, matching CTP's DicomAuditLogger.
+const AUDIT_TAGS: &[&str] = &[
+    "AccessionNumber",
+    "StudyInstanceUID",
+    "PatientName",
+    "PatientID",
+    "PatientSex",
+    "Manufacturer",
+    "ManufacturerModelName",
+    "StudyDescription",
+    "StudyDate",
+    "SeriesInstanceUID",
+    "SOPClassUID",
+    "Modality",
+    "SeriesDescription",
+    "Rows",
+    "Columns",
+    "InstitutionName",
+    "StudyTime",
+];
+
+/// A snapshot of tag values extracted from a single DICOM file.
+pub type TagSnapshot = HashMap<String, String>;
+
+/// Pre- and post-deid tag snapshots for one file.
+pub struct AuditEntry {
+    pub pre: TagSnapshot,
+    pub post: TagSnapshot,
+}
+
+fn extract_tags(obj: &InMemDicomObject, tag_names: &[&str]) -> TagSnapshot {
+    let dict = dicom_dictionary_std::StandardDataDictionary;
+    let mut snapshot = HashMap::new();
+    for &name in tag_names {
+        let value = dict
+            .by_name(name)
+            .and_then(|entry| obj.element(entry.tag()).ok())
+            .and_then(|elem| elem.value().to_str().ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        snapshot.insert(name.to_string(), value);
+    }
+    snapshot
 }
 
 impl DeidPipeline {
@@ -106,10 +153,14 @@ impl DeidPipeline {
             files_blacklisted: 0,
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut audit_entries: Vec<AuditEntry> = Vec::new();
 
         for file_path in &files {
             match self.process_file(file_path) {
-                Ok(FileOutcome::Processed) => report.files_processed += 1,
+                Ok(FileOutcome::Processed(entry)) => {
+                    audit_entries.push(entry);
+                    report.files_processed += 1;
+                }
                 Ok(FileOutcome::Blacklisted(reason)) => {
                     let relative = file_path
                         .strip_prefix(&self.config.input_dir)
@@ -133,6 +184,8 @@ impl DeidPipeline {
             self.write_blacklist_report(&blacklisted_files)?;
         }
 
+        self.write_audit_files(&audit_entries)?;
+
         Ok(report)
     }
 
@@ -145,6 +198,9 @@ impl DeidPipeline {
         if let Some(reason) = self.filter_index.blacklist_reason(&obj) {
             return Ok(FileOutcome::Blacklisted(reason.to_string()));
         }
+
+        // Snapshot tags before de-identification
+        let pre = extract_tags(&obj, AUDIT_TAGS);
 
         // Pixel de-identification
         let regions = self.filter_index.get_graylist_regions(&obj);
@@ -164,6 +220,9 @@ impl DeidPipeline {
             metadata::remove_private_tags(&mut obj);
         }
 
+        // Snapshot tags after de-identification
+        let post = extract_tags(&obj, AUDIT_TAGS);
+
         // Compute output path preserving directory structure
         let relative = file_path
             .strip_prefix(&self.config.input_dir)
@@ -178,7 +237,7 @@ impl DeidPipeline {
             DeidError::Dicom(format!("failed to write {}: {}", output_path.display(), e))
         })?;
 
-        Ok(FileOutcome::Processed)
+        Ok(FileOutcome::Processed(AuditEntry { pre, post }))
     }
 
     /// Run the pipeline with a progress callback instead of a progress bar.
@@ -193,10 +252,14 @@ impl DeidPipeline {
             files_blacklisted: 0,
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
+        let mut audit_entries: Vec<AuditEntry> = Vec::new();
 
         for file_path in &files {
             match self.process_file(file_path) {
-                Ok(FileOutcome::Processed) => report.files_processed += 1,
+                Ok(FileOutcome::Processed(entry)) => {
+                    audit_entries.push(entry);
+                    report.files_processed += 1;
+                }
                 Ok(FileOutcome::Blacklisted(reason)) => {
                     let relative = file_path
                         .strip_prefix(&self.config.input_dir)
@@ -219,6 +282,8 @@ impl DeidPipeline {
         if !blacklisted_files.is_empty() {
             self.write_blacklist_report(&blacklisted_files)?;
         }
+
+        self.write_audit_files(&audit_entries)?;
 
         Ok(report)
     }
@@ -246,10 +311,14 @@ impl DeidPipeline {
         let blacklisted_files: std::sync::Mutex<Vec<(PathBuf, String)>> =
             std::sync::Mutex::new(Vec::new());
 
+        let audit_entries: std::sync::Mutex<Vec<AuditEntry>> =
+            std::sync::Mutex::new(Vec::new());
+
         pool.install(|| {
             files.par_iter().for_each(|file_path| {
                 match self.process_file(file_path) {
-                    Ok(FileOutcome::Processed) => {
+                    Ok(FileOutcome::Processed(entry)) => {
+                        audit_entries.lock().unwrap().push(entry);
                         processed.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(FileOutcome::Blacklisted(reason)) => {
@@ -280,6 +349,9 @@ impl DeidPipeline {
             self.write_blacklist_report(&blacklisted_files)?;
         }
 
+        let audit_entries = audit_entries.into_inner().unwrap();
+        self.write_audit_files(&audit_entries)?;
+
         Ok(DeidReport {
             files_processed: processed.into_inner(),
             files_skipped: skipped.into_inner(),
@@ -296,6 +368,103 @@ impl DeidPipeline {
         }
         fs::write(&report_path, lines.join("\n") + "\n")?;
         Ok(())
+    }
+
+    /// Write audit CSV files: metadata.csv, deid_metadata.csv, and linker.csv.
+    ///
+    /// The audit CSVs mirror CTP's DicomAuditLogger output (study-level,
+    /// deduplicated by StudyInstanceUID).  The linker CSV maps original
+    /// identifiers to their de-identified counterparts, joined by the
+    /// engine's knowledge of which input produced which output.
+    fn write_audit_files(&self, entries: &[AuditEntry]) -> Result<(), DeidError> {
+        fs::create_dir_all(&self.config.output_dir)?;
+
+        // Deduplicate to study level using original StudyInstanceUID
+        let mut seen_pre: HashSet<String> = HashSet::new();
+        let mut seen_post: HashSet<String> = HashSet::new();
+        let mut pre_rows: Vec<&TagSnapshot> = Vec::new();
+        let mut post_rows: Vec<&TagSnapshot> = Vec::new();
+        let mut linker_rows: Vec<(&TagSnapshot, &TagSnapshot)> = Vec::new();
+
+        for entry in entries {
+            let pre_uid = entry.pre.get("StudyInstanceUID").cloned().unwrap_or_default();
+            let post_uid = entry.post.get("StudyInstanceUID").cloned().unwrap_or_default();
+
+            if seen_pre.insert(pre_uid) {
+                pre_rows.push(&entry.pre);
+            }
+            if seen_post.insert(post_uid) {
+                post_rows.push(&entry.post);
+                // Linker entry: one per de-identified study, linking back to original
+                linker_rows.push((&entry.pre, &entry.post));
+            }
+        }
+
+        // Write metadata.csv (pre-deid audit)
+        write_tag_csv(
+            &self.config.output_dir.join("metadata.csv"),
+            AUDIT_TAGS,
+            &pre_rows,
+        )?;
+
+        // Write deid_metadata.csv (post-deid audit)
+        write_tag_csv(
+            &self.config.output_dir.join("deid_metadata.csv"),
+            AUDIT_TAGS,
+            &post_rows,
+        )?;
+
+        // Write linker.csv
+        let linker_path = self.config.output_dir.join("linker.csv");
+        let mut f = fs::File::create(&linker_path)?;
+        writeln!(
+            f,
+            "Original PatientID,Original PatientName,Original AccessionNumber,Original StudyInstanceUID,\
+             Deidentified PatientID,Deidentified PatientName,Deidentified AccessionNumber,Deidentified StudyInstanceUID"
+        )?;
+        for (pre, post) in &linker_rows {
+            writeln!(
+                f,
+                "{},{},{},{},{},{},{},{}",
+                csv_escape(pre.get("PatientID").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(pre.get("PatientName").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(pre.get("AccessionNumber").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(pre.get("StudyInstanceUID").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(post.get("PatientID").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(post.get("PatientName").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(post.get("AccessionNumber").map(|s| s.as_str()).unwrap_or("")),
+                csv_escape(post.get("StudyInstanceUID").map(|s| s.as_str()).unwrap_or("")),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Write a CSV file with the given tag columns from a list of snapshots.
+fn write_tag_csv(
+    path: &Path,
+    columns: &[&str],
+    rows: &[&TagSnapshot],
+) -> Result<(), DeidError> {
+    let mut f = fs::File::create(path)?;
+    writeln!(f, "{}", columns.join(","))?;
+    for row in rows {
+        let values: Vec<String> = columns
+            .iter()
+            .map(|col| csv_escape(row.get(*col).map(|s| s.as_str()).unwrap_or("")))
+            .collect();
+        writeln!(f, "{}", values.join(","))?;
+    }
+    Ok(())
+}
+
+/// Escape a value for CSV: quote if it contains commas, quotes, or newlines.
+fn csv_escape(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
 }
 
