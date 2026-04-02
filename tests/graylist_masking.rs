@@ -52,6 +52,7 @@ fn run_pipeline_on_fixture(
         recipe_path: "resources/complete-recipe.txt".into(),
         variables,
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");

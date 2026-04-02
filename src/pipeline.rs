@@ -20,6 +20,10 @@ pub struct DeidConfig {
     pub recipe_path: PathBuf,
     pub variables: HashMap<String, String>,
     pub functions: HashMap<String, DeidFunction>,
+    /// When `true` (the default), all DICOM tags in odd-numbered groups
+    /// are stripped after header actions are applied.  Set to `false` to
+    /// preserve private tags.
+    pub remove_private_tags: bool,
 }
 
 /// Summary report after de-identification completes.
@@ -156,7 +160,9 @@ impl DeidPipeline {
             &self.config.functions,
             &mut obj,
         )?;
-        metadata::remove_private_tags(&mut obj);
+        if self.config.remove_private_tags {
+            metadata::remove_private_tags(&mut obj);
+        }
 
         // Compute output path preserving directory structure
         let relative = file_path
@@ -327,6 +333,7 @@ mod tests {
             recipe_path: PathBuf::from("/tmp/recipe.txt"),
             variables: HashMap::new(),
             functions: HashMap::new(),
+            remove_private_tags: true,
         };
         assert_eq!(config.input_dir, PathBuf::from("/tmp/input"));
         assert_eq!(config.output_dir, PathBuf::from("/tmp/output"));
@@ -433,6 +440,7 @@ mod tests {
             recipe_path,
             variables: HashMap::new(),
             functions: HashMap::new(),
+            remove_private_tags: true,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -537,6 +545,7 @@ mod tests {
             recipe_path,
             variables: HashMap::new(),
             functions: HashMap::new(),
+            remove_private_tags: true,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -594,6 +603,7 @@ mod tests {
             recipe_path: PathBuf::new(),
             variables: HashMap::new(),
             functions: HashMap::new(),
+            remove_private_tags: true,
         };
 
         let pipeline =

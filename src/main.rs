@@ -7,13 +7,14 @@ use std::process;
 
 fn print_usage(program: &str) {
     eprintln!(
-        "Usage: {} <input_dir> <output_dir> <recipe_file> [--var NAME VALUE]... [--lookup-table PATH]",
+        "Usage: {} <input_dir> <output_dir> <recipe_file> [OPTIONS]",
         program
     );
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --var NAME VALUE     Define a recipe variable (can be repeated)");
-    eprintln!("  --lookup-table PATH  Load a CTP-format lookup table for func:lookup");
+    eprintln!("  --var NAME VALUE       Define a recipe variable (can be repeated)");
+    eprintln!("  --lookup-table PATH    Load a CTP-format lookup table for func:lookup");
+    eprintln!("  --keep-private-tags    Preserve private tags (odd-numbered groups)");
 }
 
 fn main() {
@@ -25,6 +26,7 @@ fn main() {
 
     let mut variables: HashMap<String, String> = HashMap::new();
     let mut lookup_table_path: Option<PathBuf> = None;
+    let mut remove_private_tags = true;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -45,6 +47,10 @@ fn main() {
                 }
                 lookup_table_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
+            }
+            "--keep-private-tags" => {
+                remove_private_tags = false;
+                i += 1;
             }
             _ => {
                 eprintln!("Error: unknown argument '{}'", args[i]);
@@ -75,6 +81,7 @@ fn main() {
         recipe_path: PathBuf::from(&args[3]),
         variables,
         functions,
+        remove_private_tags,
     };
 
     let pipeline = match DeidPipeline::new(config) {

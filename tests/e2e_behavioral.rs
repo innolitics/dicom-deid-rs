@@ -221,6 +221,7 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -292,6 +293,7 @@ fn pipeline_multiple_files_nested_dirs() {
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -430,6 +432,7 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -754,6 +757,7 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -816,6 +820,7 @@ fn pipeline_no_blacklist_no_report_file() {
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
