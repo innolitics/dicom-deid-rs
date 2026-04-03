@@ -139,13 +139,26 @@ impl DeidPipeline {
 
     /// Run the de-identification pipeline.
     pub fn run(&self) -> Result<DeidReport, DeidError> {
+        use std::io::IsTerminal;
+
         let files = Self::find_dicom_files(&self.config.input_dir)?;
-        let pb = ProgressBar::new(files.len() as u64);
-        pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
+        let total = files.len();
+        let is_tty = std::io::stderr().is_terminal();
+
+        let pb = if is_tty {
+            let pb = ProgressBar::new(total as u64);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})",
+                )
                 .expect("valid progress bar template")
                 .progress_chars("=> "),
-        );
+            );
+            Some(pb)
+        } else {
+            eprintln!("Processing {} files", total);
+            None
+        };
 
         let mut report = DeidReport {
             files_processed: 0,
@@ -154,8 +167,9 @@ impl DeidPipeline {
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
         let mut audit_entries: Vec<AuditEntry> = Vec::new();
+        let log_interval = std::cmp::max(total / 20, 1);
 
-        for file_path in &files {
+        for (i, file_path) in files.iter().enumerate() {
             match self.process_file(file_path) {
                 Ok(FileOutcome::Processed(entry)) => {
                     audit_entries.push(entry);
@@ -170,15 +184,30 @@ impl DeidPipeline {
                 }
                 Err(e) => {
                     let msg = format!("Warning: skipping {}: {}", file_path.display(), e);
-                    pb.println(&msg);
+                    if let Some(ref pb) = pb {
+                        pb.println(&msg);
+                    }
                     eprintln!("{}", msg);
                     report.files_skipped += 1;
                 }
             }
-            pb.inc(1);
+            if let Some(ref pb) = pb {
+                pb.inc(1);
+            } else if (i + 1) % log_interval == 0 || i + 1 == total {
+                eprintln!(
+                    "Progress: {}/{} files ({} processed, {} blacklisted, {} skipped)",
+                    i + 1,
+                    total,
+                    report.files_processed,
+                    report.files_blacklisted,
+                    report.files_skipped,
+                );
+            }
         }
 
-        pb.finish_with_message("De-identification complete");
+        if let Some(pb) = pb {
+            pb.finish_with_message("De-identification complete");
+        }
 
         if !blacklisted_files.is_empty() {
             self.write_blacklist_report(&blacklisted_files)?;
