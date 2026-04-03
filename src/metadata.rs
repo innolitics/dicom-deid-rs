@@ -127,7 +127,22 @@ pub fn apply_header_actions(
         }
     }
 
-    // Recurse into sequence elements
+    // Recurse into sequence elements, but filter out actions that target
+    // SQ tags to avoid infinite recursion (e.g. REPLACE on a code sequence
+    // would otherwise create nested sequences endlessly).
+    let non_sq_actions: Vec<&HeaderAction> = actions
+        .iter()
+        .filter(|a| {
+            if matches!(a.action_type, ActionType::Add | ActionType::Replace) {
+                let tags = resolve_tags(&a.tag, obj).unwrap_or_default();
+                !tags.iter().any(|t| lookup_vr(obj, *t) == VR::SQ)
+            } else {
+                true
+            }
+        })
+        .collect();
+    let child_actions: Vec<HeaderAction> = non_sq_actions.into_iter().cloned().collect();
+
     let seq_tags: Vec<Tag> = obj
         .iter()
         .filter(|e| e.value().items().is_some())
@@ -146,7 +161,9 @@ pub fn apply_header_actions(
                     if seq_error.is_some() {
                         break;
                     }
-                    if let Err(e) = apply_header_actions(actions, variables, functions, item) {
+                    if let Err(e) =
+                        apply_header_actions(&child_actions, variables, functions, item)
+                    {
                         seq_error = Some(e);
                     }
                 }
