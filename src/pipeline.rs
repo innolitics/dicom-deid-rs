@@ -483,16 +483,41 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Check whether a file is a DICOM file.
+///
+/// Returns `true` if the file has a `.dcm` extension *or* contains the DICM
+/// preamble at byte offset 128.  The preamble check allows detection of
+/// DICOM files produced by tools like `storescp` that don't use a `.dcm`
+/// extension.
+fn is_dicom_file(path: &Path) -> bool {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
+    {
+        return true;
+    }
+    // Check for DICM preamble
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    if f.seek(SeekFrom::Start(128)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    if f.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    &magic == b"DICM"
+}
+
 fn find_dicom_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), DeidError> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
             find_dicom_files_recursive(&path, results)?;
-        } else if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
-        {
+        } else if is_dicom_file(&path) {
             results.push(path);
         }
     }
@@ -567,7 +592,7 @@ mod tests {
         fs::write(root.join("report.pdf"), b"PDF").expect("write");
 
         let files = DeidPipeline::find_dicom_files(root).expect("should find files");
-        assert_eq!(files.len(), 1, "should only find .dcm files");
+        assert_eq!(files.len(), 1, "should only find DICOM files");
         assert!(
             files[0]
                 .file_name()
@@ -576,6 +601,25 @@ mod tests {
                 .unwrap()
                 .ends_with(".dcm")
         );
+    }
+
+    /// Files without .dcm extension but with a valid DICM preamble
+    /// (e.g. from storescp) should be detected.
+    #[test]
+    fn r1_2_find_detects_dicom_by_preamble() {
+        let tmp = TempDir::new().expect("should create temp dir");
+        let root = tmp.path();
+
+        // storescp writes files named by SOP Instance UID, no extension
+        let mut preamble_file = vec![0u8; 128];
+        preamble_file.extend_from_slice(b"DICM");
+        fs::write(root.join("1.2.3.4.5.6.7.8.9"), &preamble_file).expect("write");
+
+        // A non-DICOM file without extension
+        fs::write(root.join("blacklisted_files.txt"), b"some text").expect("write");
+
+        let files = DeidPipeline::find_dicom_files(root).expect("should find files");
+        assert_eq!(files.len(), 1, "should detect DICOM file by preamble");
     }
 
     // -- r-1-3 ---------------------------------------------------------------
