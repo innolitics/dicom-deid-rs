@@ -4,8 +4,8 @@ use crate::tag::resolve_tags;
 use chrono::NaiveDate;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::Header;
-use dicom_core::value::{PrimitiveValue, Value};
-use dicom_core::{DataElement, Tag, VR};
+use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
+use dicom_core::{DataElement, Length, Tag, VR};
 use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::InMemDicomObject;
 use std::collections::HashMap;
@@ -54,21 +54,29 @@ pub fn apply_header_actions(
                 if obj.element(*tag).is_err() {
                     let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
                     let vr = lookup_vr(obj, *tag);
+                    if vr == VR::SQ {
+                        obj.put(build_code_sequence(*tag, &value));
+                    } else {
+                        obj.put(DataElement::new(
+                            *tag,
+                            vr,
+                            Value::Primitive(PrimitiveValue::from(value.as_str())),
+                        ));
+                    }
+                }
+            }
+            ActionType::Replace => {
+                let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                let vr = lookup_vr(obj, *tag);
+                if vr == VR::SQ {
+                    obj.put(build_code_sequence(*tag, &value));
+                } else {
                     obj.put(DataElement::new(
                         *tag,
                         vr,
                         Value::Primitive(PrimitiveValue::from(value.as_str())),
                     ));
                 }
-            }
-            ActionType::Replace => {
-                let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
-                let vr = lookup_vr(obj, *tag);
-                obj.put(DataElement::new(
-                    *tag,
-                    vr,
-                    Value::Primitive(PrimitiveValue::from(value.as_str())),
-                ));
             }
             ActionType::Jitter => {
                 let days_str = resolve_value(&action.value, variables, functions, obj, *tag)?;
@@ -240,6 +248,44 @@ fn lookup_vr(obj: &InMemDicomObject, tag: Tag) -> VR {
         return entry.vr().relaxed();
     }
     VR::LO
+}
+
+/// Build a DICOM Code Sequence element from a `/`-delimited string of code values.
+///
+/// Each code value becomes a sequence item with:
+/// - (0008,0100) CodeValue
+/// - (0008,0102) CodingSchemeDesignator = "DCM"
+///
+/// This replicates CTP's behavior for tags like DeidentificationMethodCodeSequence
+/// where the script value `113100/113105/113107` is shorthand for a code sequence.
+/// If the value contains no `/` delimiter, a single-item sequence is created.
+fn build_code_sequence(tag: Tag, value: &str) -> DataElement<InMemDicomObject> {
+    let code_value_tag = Tag(0x0008, 0x0100);
+    let coding_scheme_tag = Tag(0x0008, 0x0102);
+
+    let items: Vec<InMemDicomObject> = value
+        .split('/')
+        .map(|code| {
+            let mut item = InMemDicomObject::new_empty();
+            item.put(DataElement::new(
+                code_value_tag,
+                VR::SH,
+                Value::Primitive(PrimitiveValue::from(code.trim())),
+            ));
+            item.put(DataElement::new(
+                coding_scheme_tag,
+                VR::SH,
+                Value::Primitive(PrimitiveValue::from("DCM")),
+            ));
+            item
+        })
+        .collect();
+
+    DataElement::new(
+        tag,
+        VR::SQ,
+        Value::from(DataSetSequence::new(items, Length::UNDEFINED)),
+    )
 }
 
 #[cfg(test)]
