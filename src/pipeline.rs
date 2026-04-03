@@ -256,7 +256,15 @@ impl DeidPipeline {
         let relative = file_path
             .strip_prefix(&self.config.input_dir)
             .map_err(|e| DeidError::Io(std::io::Error::other(e)))?;
-        let output_path = self.config.output_dir.join(relative);
+        let mut output_path = self.config.output_dir.join(relative);
+        if output_path.extension().is_none_or(|ext| !ext.eq_ignore_ascii_case("dcm")) {
+            let mut name = output_path
+                .file_name()
+                .unwrap_or_default()
+                .to_os_string();
+            name.push(".dcm");
+            output_path.set_file_name(name);
+        }
 
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
