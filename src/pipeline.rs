@@ -26,6 +26,10 @@ pub struct DeidConfig {
     /// are stripped after header actions are applied.  Set to `false` to
     /// preserve private tags.
     pub remove_private_tags: bool,
+    /// When `true`, tags not targeted by any header action are removed
+    /// after processing.  Exempt: SOPClassUID, SOPInstanceUID,
+    /// StudyInstanceUID, group 0028, and any keep-groups from the recipe.
+    pub remove_unspecified_elements: bool,
 }
 
 /// Summary report after de-identification completes.
@@ -90,6 +94,57 @@ fn extract_tags(obj: &InMemDicomObject, tag_names: &[&str]) -> TagSnapshot {
         snapshot.insert(name.to_string(), value);
     }
     snapshot
+}
+
+/// Build output path from de-identified DICOM tags, matching CTP's structure:
+///   `DATE-{StudyDate}--{Modality}--PID-{PatientID}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm`
+fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
+    let dict = dicom_dictionary_std::StandardDataDictionary;
+
+    let get = |name: &str| -> String {
+        dict.by_name(name)
+            .and_then(|entry| obj.element(entry.tag()).ok())
+            .and_then(|elem| elem.value().to_str().ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+
+    let study_date = get("StudyDate");
+    let modality = get("Modality");
+    let patient_id = get("PatientID");
+    let series_number = get("SeriesNumber");
+    let sop_instance_uid = get("SOPInstanceUID");
+
+    let date_part = if study_date.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        study_date
+    };
+    let modality_part = if modality.is_empty() {
+        "UN".to_string()
+    } else {
+        modality
+    };
+    let pid_part = if patient_id.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        patient_id
+    };
+    let ser_part = if series_number.is_empty() {
+        "SER-00000".to_string()
+    } else if let Ok(n) = series_number.parse::<u32>() {
+        format!("SER-{:05}", n)
+    } else {
+        format!("SER-{}", series_number)
+    };
+    let file_name = if sop_instance_uid.is_empty() {
+        "unknown.dcm".to_string()
+    } else {
+        format!("{}.dcm", sop_instance_uid)
+    };
+
+    let study_dir = format!("DATE-{}--{}--PID-{}", date_part, modality_part, pid_part);
+    output_dir.join(study_dir).join(ser_part).join(file_name)
 }
 
 impl DeidPipeline {
@@ -249,22 +304,17 @@ impl DeidPipeline {
             metadata::remove_private_tags(&mut obj);
         }
 
+        // Remove unspecified elements if configured
+        if self.config.remove_unspecified_elements {
+            metadata::remove_unspecified_elements(&mut obj, &self.recipe);
+        }
+
         // Snapshot tags after de-identification
         let post = extract_tags(&obj, AUDIT_TAGS);
 
-        // Compute output path preserving directory structure
-        let relative = file_path
-            .strip_prefix(&self.config.input_dir)
-            .map_err(|e| DeidError::Io(std::io::Error::other(e)))?;
-        let mut output_path = self.config.output_dir.join(relative);
-        if output_path.extension().is_none_or(|ext| !ext.eq_ignore_ascii_case("dcm")) {
-            let mut name = output_path
-                .file_name()
-                .unwrap_or_default()
-                .to_os_string();
-            name.push(".dcm");
-            output_path.set_file_name(name);
-        }
+        // Build output path using de-identified tags to match CTP's structure:
+        //   DATE-{StudyDate}--{Modality}--PID-{PatientID}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm
+        let output_path = build_output_path(&self.config.output_dir, &obj);
 
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -579,6 +629,7 @@ mod tests {
             variables: HashMap::new(),
             functions: HashMap::new(),
             remove_private_tags: true,
+            remove_unspecified_elements: false,
         };
         assert_eq!(config.input_dir, PathBuf::from("/tmp/input"));
         assert_eq!(config.output_dir, PathBuf::from("/tmp/output"));
@@ -671,7 +722,7 @@ mod tests {
         let output_dir = tmp.path().join("output");
         fs::create_dir_all(&input_dir).expect("create input dir");
 
-        // Create a minimal valid DICOM file
+        // Create a minimal valid DICOM file with tags needed for output path
         let mut file_obj = create_test_file_obj();
         put_str(
             &mut file_obj,
@@ -681,9 +732,33 @@ mod tests {
         );
         put_str(
             &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_ID,
+            dicom_core::VR::LO,
+            "PID001",
+        );
+        put_str(
+            &mut file_obj,
             dicom_dictionary_std::tags::MODALITY,
             dicom_core::VR::CS,
             "CT",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::STUDY_DATE,
+            dicom_core::VR::DA,
+            "20250101",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SERIES_NUMBER,
+            dicom_core::VR::IS,
+            "1",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SOP_INSTANCE_UID,
+            dicom_core::VR::UI,
+            "1.2.3.4.5.6.7.8.9",
         );
         let dcm_path = input_dir.join("test.dcm");
         file_obj
@@ -705,6 +780,7 @@ mod tests {
             variables: HashMap::new(),
             functions: HashMap::new(),
             remove_private_tags: true,
+            remove_unspecified_elements: false,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -714,9 +790,12 @@ mod tests {
         assert_eq!(report.files_skipped, 0);
         assert_eq!(report.files_blacklisted, 0);
 
-        // Verify output file exists
-        let output_file = output_dir.join("test.dcm");
-        assert!(output_file.exists(), "output file should exist");
+        // Verify output file exists at CTP-style path
+        let output_file = output_dir
+            .join("DATE-20250101--CT--PID-PID001")
+            .join("SER-00001")
+            .join("1.2.3.4.5.6.7.8.9.dcm");
+        assert!(output_file.exists(), "output file should exist at CTP-style path: {}", output_file.display());
 
         // Verify the patient name was replaced
         let result_obj = open_file(&output_file).expect("should open output");
@@ -743,7 +822,9 @@ mod tests {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
                 value: Some(ActionValue::Literal("YES".into())),
+                condition: None,
             }],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Blacklist,
                 labels: vec![FilterLabel {
@@ -810,6 +891,7 @@ mod tests {
             variables: HashMap::new(),
             functions: HashMap::new(),
             remove_private_tags: true,
+            remove_unspecified_elements: false,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -852,9 +934,33 @@ mod tests {
         );
         put_str(
             &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_ID,
+            dicom_core::VR::LO,
+            "PID001",
+        );
+        put_str(
+            &mut file_obj,
             dicom_dictionary_std::tags::MODALITY,
             dicom_core::VR::CS,
             "CT",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::STUDY_DATE,
+            dicom_core::VR::DA,
+            "20250101",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SERIES_NUMBER,
+            dicom_core::VR::IS,
+            "1",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SOP_INSTANCE_UID,
+            dicom_core::VR::UI,
+            "1.2.3.4.5.6.7.8.9",
         );
         file_obj
             .write_to_file(input_dir.join("test.dcm"))
@@ -868,6 +974,7 @@ mod tests {
             variables: HashMap::new(),
             functions: HashMap::new(),
             remove_private_tags: true,
+            remove_unspecified_elements: false,
         };
 
         let pipeline =
@@ -877,7 +984,11 @@ mod tests {
         let report = report.unwrap();
         assert_eq!(report.files_processed, 1);
 
-        let result_obj = open_file(output_dir.join("test.dcm")).expect("should open output");
+        let output_file = output_dir
+            .join("DATE-20250101--CT--PID-PID001")
+            .join("SER-00001")
+            .join("1.2.3.4.5.6.7.8.9.dcm");
+        let result_obj = open_file(&output_file).expect("should open output");
         let val = result_obj
             .element_by_name("PatientName")
             .expect("should have PatientName")

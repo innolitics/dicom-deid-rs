@@ -512,6 +512,7 @@ mod tests {
         Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![
                 FilterSection {
                     filter_type: FilterType::Blacklist,
@@ -908,6 +909,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {

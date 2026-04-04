@@ -1,5 +1,5 @@
 use crate::error::DeidError;
-use crate::recipe::{ActionType, ActionValue, HeaderAction};
+use crate::recipe::{ActionCondition, ActionType, ActionValue, HeaderAction, KeepGroup, Recipe};
 use crate::tag::resolve_tags;
 use chrono::NaiveDate;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
@@ -8,7 +8,7 @@ use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
 use dicom_core::{DataElement, Length, Tag, VR};
 use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::InMemDicomObject;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A function that can be referenced via `func:<name>` in a recipe.
 #[cfg(feature = "parallel")]
@@ -48,6 +48,15 @@ pub fn apply_header_actions(
 
     // Apply each winning action
     for (tag, action) in &winning {
+        // Check condition before executing the action
+        if action
+            .condition
+            .as_ref()
+            .is_some_and(|c| !evaluate_condition(c, obj))
+        {
+            continue;
+        }
+
         match action.action_type {
             ActionType::Keep => { /* no-op */ }
             ActionType::Add => {
@@ -124,54 +133,119 @@ pub fn apply_header_actions(
                     Value::Primitive(PrimitiveValue::from("")),
                 ));
             }
-        }
-    }
-
-    // Recurse into sequence elements, but filter out actions that target
-    // SQ tags to avoid infinite recursion (e.g. REPLACE on a code sequence
-    // would otherwise create nested sequences endlessly).
-    let non_sq_actions: Vec<&HeaderAction> = actions
-        .iter()
-        .filter(|a| {
-            if matches!(a.action_type, ActionType::Add | ActionType::Replace) {
-                let tags = resolve_tags(&a.tag, obj).unwrap_or_default();
-                !tags.iter().any(|t| lookup_vr(obj, *t) == VR::SQ)
-            } else {
-                true
-            }
-        })
-        .collect();
-    let child_actions: Vec<HeaderAction> = non_sq_actions.into_iter().cloned().collect();
-
-    let seq_tags: Vec<Tag> = obj
-        .iter()
-        .filter(|e| e.value().items().is_some())
-        .map(|e| e.header().tag())
-        .collect();
-
-    for seq_tag in seq_tags {
-        let mut elem = match obj.take_element(seq_tag) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let mut seq_error: Option<DeidError> = None;
-        elem.update_value(|val| {
-            if let Some(items) = val.items_mut() {
-                for item in items.iter_mut() {
-                    if seq_error.is_some() {
-                        break;
-                    }
-                    if let Err(e) =
-                        apply_header_actions(&child_actions, variables, functions, item)
-                    {
-                        seq_error = Some(e);
+            ActionType::ReplaceOnly => {
+                // Only replace if the tag already exists
+                if obj.element(*tag).is_ok() {
+                    let value = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                    let vr = lookup_vr(obj, *tag);
+                    if vr == VR::SQ {
+                        obj.put(build_code_sequence(*tag, &value));
+                    } else {
+                        obj.put(DataElement::new(
+                            *tag,
+                            vr,
+                            Value::Primitive(PrimitiveValue::from(value.as_str())),
+                        ));
                     }
                 }
             }
-        });
-        obj.put(elem);
-        if let Some(e) = seq_error {
-            return Err(e);
+            ActionType::Append => {
+                let new_val = resolve_value(&action.value, variables, functions, obj, *tag)?;
+                let current = obj
+                    .element(*tag)
+                    .ok()
+                    .and_then(|e| e.value().to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let combined = if current.is_empty() {
+                    new_val
+                } else {
+                    format!("{}\\{}", current, new_val)
+                };
+                let vr = lookup_vr(obj, *tag);
+                obj.put(DataElement::new(
+                    *tag,
+                    vr,
+                    Value::Primitive(PrimitiveValue::from(combined.as_str())),
+                ));
+            }
+            ActionType::Process => {
+                // Handled in the sequence recursion phase below, not here.
+            }
+        }
+    }
+
+    // Recurse into sequence elements that have a Process action.
+    // CTP only recurses into sequences explicitly marked with @process().
+    // When recursing, Replace→ReplaceOnly and Add→skip to prevent
+    // injecting new elements into item datasets (CTP rule).
+    // Only include tags that are actually SQ elements present in this object.
+    let process_tags: Vec<Tag> = winning
+        .iter()
+        .filter(|(_, a)| a.action_type == ActionType::Process)
+        .map(|(t, _)| *t)
+        .filter(|t| obj.element(*t).is_ok_and(|e| e.value().items().is_some()))
+        .collect();
+
+    if !process_tags.is_empty() {
+        // Build child actions: no SQ-targeted Add/Replace, and convert
+        // Replace→ReplaceOnly to prevent element injection into items.
+        let child_actions: Vec<HeaderAction> = actions
+            .iter()
+            .filter_map(|a| {
+                // Keep Process actions for inner sequences (they'll be needed
+                // when recursing further), but skip Process actions for the
+                // sequences we're already processing at this level.
+                if a.action_type == ActionType::Process {
+                    let tags = resolve_tags(&a.tag, obj).unwrap_or_default();
+                    if tags.iter().any(|t| process_tags.contains(t)) {
+                        return None; // Already being processed at this level
+                    }
+                    return Some(a.clone()); // Pass through for inner levels
+                }
+                // Skip non-Process SQ-targeted Add/Replace to avoid infinite
+                // recursion (e.g. writing a literal into an SQ field).
+                if matches!(a.action_type, ActionType::Add | ActionType::Replace | ActionType::ReplaceOnly) {
+                    let tags = resolve_tags(&a.tag, obj).unwrap_or_default();
+                    if tags.iter().any(|t| lookup_vr(obj, *t) == VR::SQ) {
+                        return None;
+                    }
+                }
+                match a.action_type {
+                    ActionType::Add => None, // No new elements in item datasets
+                    ActionType::Replace => Some(HeaderAction {
+                        action_type: ActionType::ReplaceOnly,
+                        ..a.clone()
+                    }),
+                    _ => Some(a.clone()),
+                }
+            })
+            .collect();
+
+        for seq_tag in &process_tags {
+            let mut elem = match obj.take_element(*seq_tag) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let mut seq_error: Option<DeidError> = None;
+            elem.update_value(|val| {
+                if let Some(items) = val.items_mut() {
+                    for item in items.iter_mut() {
+                        if seq_error.is_some() {
+                            break;
+                        }
+                        if let Err(e) =
+                            apply_header_actions(&child_actions, variables, functions, item)
+                        {
+                            seq_error = Some(e);
+                        }
+                    }
+                }
+            });
+            obj.put(elem);
+            if let Some(e) = seq_error {
+                return Err(e);
+            }
         }
     }
 
@@ -221,9 +295,12 @@ pub fn action_precedence(action: &ActionType) -> u8 {
         ActionType::Keep => 0,
         ActionType::Add => 1,
         ActionType::Replace => 2,
+        ActionType::ReplaceOnly => 2,
         ActionType::Jitter => 3,
         ActionType::Remove => 4,
         ActionType::Blank => 5,
+        ActionType::Append => 1,
+        ActionType::Process => 2,
     }
 }
 
@@ -240,7 +317,7 @@ fn resolve_value(
             .get(name)
             .cloned()
             .ok_or_else(|| DeidError::VariableNotFound(name.clone())),
-        Some(ActionValue::Function { name }) => {
+        Some(ActionValue::Function { name, .. }) => {
             let func = functions
                 .get(name)
                 .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
@@ -267,32 +344,106 @@ fn lookup_vr(obj: &InMemDicomObject, tag: Tag) -> VR {
     VR::LO
 }
 
+/// Evaluate a condition against the current DICOM object.
+fn evaluate_condition(condition: &ActionCondition, obj: &InMemDicomObject) -> bool {
+    let dict = StandardDataDictionary;
+    let get_value = |element_name: &str| -> Option<String> {
+        let tag = if element_name == "this" {
+            return None; // "this" is handled by the caller
+        } else {
+            dict.by_name(element_name).map(|e| e.tag())?
+        };
+        obj.element(tag)
+            .ok()
+            .and_then(|e| e.value().to_str().ok())
+            .map(|s| s.trim().to_string())
+    };
+
+    let is_blank = |element_name: &str| -> bool {
+        match get_value(element_name) {
+            None => true,
+            Some(v) => v.trim().is_empty(),
+        }
+    };
+
+    let element_exists = |element_name: &str| -> bool {
+        dict.by_name(element_name)
+            .is_some_and(|e| obj.element(e.tag()).is_ok())
+    };
+
+    match condition {
+        ActionCondition::IsBlank { element } => is_blank(element),
+        ActionCondition::IsNotBlank { element } => !is_blank(element),
+        ActionCondition::Exists { element } => element_exists(element),
+        ActionCondition::NotExists { element } => !element_exists(element),
+        ActionCondition::Contains { element, value } => get_value(element)
+            .is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase())),
+        ActionCondition::NotContains { element, value } => !get_value(element)
+            .is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase())),
+        ActionCondition::Equals { element, value } => {
+            get_value(element).is_some_and(|v| v.eq_ignore_ascii_case(value))
+        }
+        ActionCondition::NotEquals { element, value } => {
+            !get_value(element).is_some_and(|v| v.eq_ignore_ascii_case(value))
+        }
+        ActionCondition::Matches { element, pattern } => {
+            let Ok(re) = regex::Regex::new(pattern) else {
+                return false;
+            };
+            get_value(element).is_some_and(|v| re.is_match(&v))
+        }
+        ActionCondition::GreaterThan { element, value } => {
+            let parse_numeric = |s: &str| -> Option<i64> {
+                let digits: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
+                digits.parse().ok()
+            };
+            match (get_value(element).and_then(|v| parse_numeric(&v)), parse_numeric(value)) {
+                (Some(a), Some(b)) => a > b,
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Build a DICOM Code Sequence element from a `/`-delimited string of code values.
 ///
 /// Each code value becomes a sequence item with:
 /// - (0008,0100) CodeValue
 /// - (0008,0102) CodingSchemeDesignator = "DCM"
+/// - (0008,0104) CodeMeaning (looked up from CID 7050)
 ///
-/// This replicates CTP's behavior for tags like DeidentificationMethodCodeSequence
-/// where the script value `113100/113105/113107` is shorthand for a code sequence.
-/// If the value contains no `/` delimiter, a single-item sequence is created.
+/// Replicates CTP's behavior for DeidentificationMethodCodeSequence (0012,0064).
+/// If the value starts with `RESET/`, any pre-existing items are cleared first.
 fn build_code_sequence(tag: Tag, value: &str) -> DataElement<InMemDicomObject> {
     let code_value_tag = Tag(0x0008, 0x0100);
     let coding_scheme_tag = Tag(0x0008, 0x0102);
+    let code_meaning_tag = Tag(0x0008, 0x0104);
 
-    let items: Vec<InMemDicomObject> = value
+    // Strip RESET prefix (handled by caller clearing existing element)
+    let codes_str = value
+        .strip_prefix("RESET/")
+        .or_else(|| value.strip_prefix("RESET /"))
+        .unwrap_or(value);
+
+    let items: Vec<InMemDicomObject> = codes_str
         .split('/')
         .map(|code| {
+            let code = code.trim();
             let mut item = InMemDicomObject::new_empty();
             item.put(DataElement::new(
                 code_value_tag,
                 VR::SH,
-                Value::Primitive(PrimitiveValue::from(code.trim())),
+                Value::Primitive(PrimitiveValue::from(code)),
             ));
             item.put(DataElement::new(
                 coding_scheme_tag,
                 VR::SH,
                 Value::Primitive(PrimitiveValue::from("DCM")),
+            ));
+            item.put(DataElement::new(
+                code_meaning_tag,
+                VR::LO,
+                Value::Primitive(PrimitiveValue::from(cid_7050_meaning(code))),
             ));
             item
         })
@@ -303,6 +454,102 @@ fn build_code_sequence(tag: Tag, value: &str) -> DataElement<InMemDicomObject> {
         VR::SQ,
         Value::from(DataSetSequence::new(items, Length::UNDEFINED)),
     )
+}
+
+/// Look up the CodeMeaning for a CID 7050 De-identification Method code.
+fn cid_7050_meaning(code: &str) -> &'static str {
+    match code {
+        "113100" => "Basic Application Confidentiality Profile",
+        "113101" => "Clean Pixel Data Option",
+        "113102" => "Clean Recognizable Visual Features Option",
+        "113103" => "Clean Graphics Option",
+        "113104" => "Clean Structured Content Option",
+        "113105" => "Clean Descriptors Option",
+        "113106" => "Retain Longitudinal With Full Dates Option",
+        "113107" => "Retain Longitudinal With Modified Dates Option",
+        "113108" => "Retain Patient Characteristics Option",
+        "113109" => "Retain Device Identity Option",
+        "113110" => "Retain UIDs",
+        "113111" => "Retain Safe Private Option",
+        _ => "Unknown",
+    }
+}
+
+/// Remove all elements from the DICOM object that are not targeted by any
+/// header action in the recipe and are not in an exempt set.
+///
+/// Exempt tags/groups:
+/// - SOPClassUID (0008,0016), SOPInstanceUID (0008,0018),
+///   StudyInstanceUID (0020,000d), TransferSyntaxUID (0002,0010)
+/// - Group 0x0028 (pixel parameters)
+/// - Groups listed in `recipe.keep_groups`
+/// - Overlay groups (0x6000-0x601e) when the recipe does not REMOVE them
+pub fn remove_unspecified_elements(obj: &mut InMemDicomObject, recipe: &Recipe) {
+    // 1. Collect all tags targeted by any HeaderAction
+    let mut targeted_tags: HashSet<Tag> = HashSet::new();
+    for action in &recipe.header {
+        if let Ok(tags) = resolve_tags(&action.tag, obj) {
+            for tag in tags {
+                targeted_tags.insert(tag);
+            }
+        }
+    }
+
+    // 2. Add exempt tags
+    targeted_tags.insert(Tag(0x0008, 0x0016)); // SOPClassUID
+    targeted_tags.insert(Tag(0x0008, 0x0018)); // SOPInstanceUID
+    targeted_tags.insert(Tag(0x0020, 0x000d)); // StudyInstanceUID
+    targeted_tags.insert(Tag(0x0002, 0x0010)); // TransferSyntaxUID
+
+    // 3. Collect exempt groups
+    let mut exempt_groups: HashSet<u16> = HashSet::new();
+    exempt_groups.insert(0x0028); // pixel parameters
+
+    // 4. Add exempt groups from recipe.keep_groups
+    let mut skip_odd_groups = false;
+    for kg in &recipe.keep_groups {
+        match kg {
+            KeepGroup::Group(n) => {
+                exempt_groups.insert(*n);
+            }
+            KeepGroup::SafePrivateElements => {
+                skip_odd_groups = true;
+            }
+        }
+    }
+
+    // 5. Check if overlays are being removed — look for a REMOVE action targeting 60xx groups
+    let overlays_removed = recipe.header.iter().any(|action| {
+        if action.action_type != ActionType::Remove {
+            return false;
+        }
+        if let Ok(tags) = resolve_tags(&action.tag, obj) {
+            tags.iter()
+                .any(|t| t.group() >= 0x6000 && t.group() <= 0x601e)
+        } else {
+            false
+        }
+    });
+    if !overlays_removed {
+        for g in (0x6000..=0x601eu16).step_by(2) {
+            exempt_groups.insert(g);
+        }
+    }
+
+    // 6. Iterate all tags in the object, remove any not in targeted/exempt set
+    let all_tags: Vec<Tag> = obj.iter().map(|e| e.tag()).collect();
+    for tag in all_tags {
+        if targeted_tags.contains(&tag) {
+            continue;
+        }
+        if exempt_groups.contains(&tag.group()) {
+            continue;
+        }
+        if skip_odd_groups && tag.group() % 2 != 0 {
+            continue;
+        }
+        let _ = obj.remove_element(tag);
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +579,7 @@ mod tests {
             action_type: ActionType::Add,
             tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
             value: Some(ActionValue::Literal("YES".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -354,6 +602,7 @@ mod tests {
             action_type: ActionType::Add,
             tag: TagSpecifier::Keyword("PatientID".into()),
             value: Some(ActionValue::Literal("NEW".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -381,6 +630,7 @@ mod tests {
             action_type: ActionType::Replace,
             tag: TagSpecifier::Keyword("PatientID".into()),
             value: Some(ActionValue::Literal("REPLACED_ID".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -405,6 +655,7 @@ mod tests {
             action_type: ActionType::Remove,
             tag: TagSpecifier::Keyword("OperatorsName".into()),
             value: None,
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -440,7 +691,9 @@ mod tests {
             tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
             value: Some(ActionValue::Function {
                 name: "hashuid".into(),
+                args: vec![],
             }),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &functions, &mut obj)
@@ -464,7 +717,9 @@ mod tests {
             tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
             value: Some(ActionValue::Function {
                 name: "nonexistent".into(),
+                args: vec![],
             }),
+            condition: None,
         }];
 
         let result = apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
@@ -483,6 +738,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::Keyword("StudyDate".into()),
             value: Some(ActionValue::Literal("5".into())), // shift +5 days
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -505,6 +761,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::Keyword("StudyDate".into()),
             value: Some(ActionValue::Literal("5".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -527,6 +784,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::Keyword("StudyDate".into()),
             value: Some(ActionValue::Literal("-10".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -554,6 +812,7 @@ mod tests {
             action_type: ActionType::Replace,
             tag: TagSpecifier::Keyword("PatientID".into()),
             value: Some(ActionValue::Variable("NEWID".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &vars, &empty_funcs(), &mut obj).expect("should succeed");
@@ -575,6 +834,7 @@ mod tests {
             action_type: ActionType::Replace,
             tag: TagSpecifier::Keyword("PatientID".into()),
             value: Some(ActionValue::Variable("UNDEFINED".into())),
+            condition: None,
         }];
 
         let result = apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
@@ -596,6 +856,7 @@ mod tests {
             action_type: ActionType::Blank,
             tag: TagSpecifier::Keyword("PatientName".into()),
             value: None,
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -622,11 +883,13 @@ mod tests {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -653,11 +916,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -681,11 +946,13 @@ mod tests {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("REPLACED".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("ADDED".into())),
+                condition: None,
             },
         ];
 
@@ -714,11 +981,13 @@ mod tests {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("5".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("19000101".into())),
+                condition: None,
             },
         ];
 
@@ -747,11 +1016,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("5".into())),
+                condition: None,
             },
         ];
 
@@ -776,11 +1047,13 @@ mod tests {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -883,11 +1156,13 @@ mod tests {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("ADDED".into())),
+                condition: None,
             },
         ];
 
@@ -913,11 +1188,13 @@ mod tests {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("5".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -943,11 +1220,13 @@ mod tests {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("PatientName".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -972,11 +1251,13 @@ mod tests {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("ADDED_VAL".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("5".into())),
+                condition: None,
             },
         ];
 
@@ -1001,11 +1282,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("ADDED_VAL".into())),
+                condition: None,
             },
         ];
 
@@ -1030,11 +1313,13 @@ mod tests {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("ADDED_VAL".into())),
+                condition: None,
             },
         ];
 
@@ -1060,11 +1345,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("REPLACED".into())),
+                condition: None,
             },
         ];
 
@@ -1090,11 +1377,13 @@ mod tests {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("REPLACED".into())),
+                condition: None,
             },
         ];
 
@@ -1120,11 +1409,13 @@ mod tests {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("5".into())),
+                condition: None,
             },
         ];
 
@@ -1150,11 +1441,13 @@ mod tests {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("FIRST".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("SECOND".into())),
+                condition: None,
             },
         ];
 
@@ -1184,11 +1477,13 @@ mod tests {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("FIRST".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("SECOND".into())),
+                condition: None,
             },
         ];
 
@@ -1226,11 +1521,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -1261,11 +1558,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
                 value: Some(ActionValue::Literal("YES".into())),
+                condition: None,
             },
         ];
 
@@ -1300,11 +1599,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("19700101".into())),
+                condition: None,
             },
         ];
 
@@ -1339,11 +1640,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("1".into())),
+                condition: None,
             },
         ];
 
@@ -1378,16 +1681,19 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("19700101".into())),
+                condition: None,
             },
         ];
 
@@ -1417,16 +1723,19 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Pattern(".*".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("1".into())),
+                condition: None,
             },
         ];
 
@@ -1456,16 +1765,19 @@ mod tests {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientIdentityRemoved".into()),
                 value: Some(ActionValue::Literal("YES".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Blank,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -1495,11 +1807,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("19700101".into())),
+                condition: None,
             },
         ];
 
@@ -1525,11 +1839,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("1".into())),
+                condition: None,
             },
         ];
 
@@ -1555,11 +1871,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -1584,11 +1902,13 @@ mod tests {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("NEW_VAL".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
         ];
 
@@ -1614,11 +1934,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Add,
                 tag: TagSpecifier::Keyword("PatientID".into()),
                 value: Some(ActionValue::Literal("NEW_VAL".into())),
+                condition: None,
             },
         ];
 
@@ -1648,11 +1970,13 @@ mod tests {
                 action_type: ActionType::Jitter,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("1".into())),
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Replace,
                 tag: TagSpecifier::Keyword("StudyDate".into()),
                 value: Some(ActionValue::Literal("19700101".into())),
+                condition: None,
             },
         ];
 
@@ -1682,6 +2006,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::Keyword("StudyDate".into()),
             value: Some(ActionValue::Literal("1".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -1709,6 +2034,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::Keyword("StudyDate".into()),
             value: Some(ActionValue::Literal("1".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -1737,6 +2063,7 @@ mod tests {
             action_type: ActionType::Jitter,
             tag: TagSpecifier::TagValue(private_tag),
             value: Some(ActionValue::Literal("1".into())),
+            condition: None,
         }];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
@@ -1755,6 +2082,15 @@ mod tests {
     /// ReferencedSeriesSequence tag used as the sequence container in tests.
     const SEQ_TAG: Tag = Tag(0x0008, 0x1115);
 
+    fn process_action(tag: Tag) -> HeaderAction {
+        HeaderAction {
+            action_type: ActionType::Process,
+            tag: TagSpecifier::TagValue(tag),
+            value: None,
+            condition: None,
+        }
+    }
+
     /// Requirement r-3-13: REPLACE modifies a field within a sequence item.
     #[test]
     fn r3_13_replace_inside_sequence() {
@@ -1764,11 +2100,15 @@ mod tests {
         let mut obj = create_test_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
-        let actions = vec![HeaderAction {
-            action_type: ActionType::Replace,
-            tag: TagSpecifier::Keyword("AccessionNumber".into()),
-            value: Some(ActionValue::Literal("ACC-REPLACED".into())),
-        }];
+        let actions = vec![
+            process_action(SEQ_TAG),
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: Some(ActionValue::Literal("ACC-REPLACED".into())),
+                condition: None,
+            },
+        ];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
@@ -1793,11 +2133,15 @@ mod tests {
         let mut obj = create_test_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
-        let actions = vec![HeaderAction {
-            action_type: ActionType::Remove,
-            tag: TagSpecifier::Keyword("AccessionNumber".into()),
-            value: None,
-        }];
+        let actions = vec![
+            process_action(SEQ_TAG),
+            HeaderAction {
+                action_type: ActionType::Remove,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: None,
+                condition: None,
+            },
+        ];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
@@ -1822,11 +2166,15 @@ mod tests {
         let mut obj = create_test_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
-        let actions = vec![HeaderAction {
-            action_type: ActionType::Blank,
-            tag: TagSpecifier::Keyword("AccessionNumber".into()),
-            value: None,
-        }];
+        let actions = vec![
+            process_action(SEQ_TAG),
+            HeaderAction {
+                action_type: ActionType::Blank,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: None,
+                condition: None,
+            },
+        ];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
@@ -1854,11 +2202,15 @@ mod tests {
         let mut obj = create_test_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
-        let actions = vec![HeaderAction {
-            action_type: ActionType::Jitter,
-            tag: TagSpecifier::Keyword("StudyDate".into()),
-            value: Some(ActionValue::Literal("5".into())),
-        }];
+        let actions = vec![
+            process_action(SEQ_TAG),
+            HeaderAction {
+                action_type: ActionType::Jitter,
+                tag: TagSpecifier::Keyword("StudyDate".into()),
+                value: Some(ActionValue::Literal("5".into())),
+                condition: None,
+            },
+        ];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
@@ -1887,11 +2239,16 @@ mod tests {
         let outer_seq_tag = Tag(0x0008, 0x1200); // StudiesContainingOtherReferencedInstancesSequence
         put_sequence(&mut obj, outer_seq_tag, vec![outer_item]);
 
-        let actions = vec![HeaderAction {
-            action_type: ActionType::Replace,
-            tag: TagSpecifier::Keyword("AccessionNumber".into()),
-            value: Some(ActionValue::Literal("REPLACED-DEEP".into())),
-        }];
+        let actions = vec![
+            process_action(outer_seq_tag),
+            process_action(SEQ_TAG),
+            HeaderAction {
+                action_type: ActionType::Replace,
+                tag: TagSpecifier::Keyword("AccessionNumber".into()),
+                value: Some(ActionValue::Literal("REPLACED-DEEP".into())),
+                condition: None,
+            },
+        ];
 
         apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
             .expect("should succeed");
@@ -1921,11 +2278,13 @@ mod tests {
                 action_type: ActionType::Remove,
                 tag: TagSpecifier::Keyword("AccessionNumber".into()),
                 value: None,
+                condition: None,
             },
             HeaderAction {
                 action_type: ActionType::Keep,
                 tag: TagSpecifier::Keyword("AccessionNumber".into()),
                 value: None,
+                condition: None,
             },
         ];
 

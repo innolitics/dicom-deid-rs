@@ -84,6 +84,115 @@ fn hashptid(input: &str) -> Result<String, DeidError> {
     Ok(format!("{:010}", num))
 }
 
+/// Return current date as YYYYMMDD. Input is ignored.
+fn date(_input: &str) -> Result<String, DeidError> {
+    Ok(chrono::Local::now().format("%Y%m%d").to_string())
+}
+
+/// Return current time as HHMMSS. Input is ignored.
+fn time(_input: &str) -> Result<String, DeidError> {
+    Ok(chrono::Local::now().format("%H%M%S").to_string())
+}
+
+/// Return a string of spaces. Returns a single space (args will be supported
+/// later via the extended ActionValue::Function args).
+fn blank(_input: &str) -> Result<String, DeidError> {
+    Ok(" ".to_string())
+}
+
+/// Bin a numeric value by group size. Default group size is 10.
+///
+/// Strips trailing non-numeric suffix (e.g. "Y" in "57Y") and re-appends it
+/// after rounding.
+fn round(input: &str) -> Result<String, DeidError> {
+    let numeric: String = input
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    let suffix: String = input
+        .chars()
+        .skip_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    let n: i64 = numeric.parse().unwrap_or(0);
+    let group_size: i64 = 10;
+    let rounded = ((n + group_size / 2) / group_size) * group_size;
+    Ok(format!("{}{}", rounded, suffix))
+}
+
+/// Return a deterministic hash-based integer for the input.
+///
+/// True sequential integers require shared state which will be added later.
+fn integer(input: &str) -> Result<String, DeidError> {
+    let hash = Sha256::digest(input.as_bytes());
+    let bytes: [u8; 8] = hash[..8].try_into().expect("8 bytes");
+    let num = u64::from_be_bytes(bytes) % 100000;
+    Ok(format!("{:05}", num))
+}
+
+/// Extract initials from DICOM PersonName format (Last^First^Middle).
+///
+/// Returns initials in First-Middle-Last order (e.g. "Doe^John^Michael" → "JMD"),
+/// matching CTP behavior.
+fn initials(input: &str) -> Result<String, DeidError> {
+    let parts: Vec<&str> = input.split('^').collect();
+    let mut result = String::new();
+    // DICOM order: Last^First^Middle — CTP returns FML
+    if let Some(first) = parts.get(1)
+        && let Some(c) = first.chars().next()
+    {
+        result.push(c.to_ascii_uppercase());
+    }
+    if let Some(middle) = parts.get(2)
+        && let Some(c) = middle.chars().next()
+    {
+        result.push(c.to_ascii_uppercase());
+    }
+    if let Some(last) = parts.first()
+        && let Some(c) = last.chars().next()
+    {
+        result.push(c.to_ascii_uppercase());
+    }
+    Ok(result)
+}
+
+/// Return the input value as-is (identity function).
+///
+/// Cross-element lookup is handled by the CTP translator which resolves
+/// element references before calling.
+fn contents(input: &str) -> Result<String, DeidError> {
+    Ok(input.to_string())
+}
+
+/// Same as contents (identity). Default value handling is done by the translator.
+fn value(input: &str) -> Result<String, DeidError> {
+    Ok(input.to_string())
+}
+
+/// Return the input truncated. Default: first 10 characters.
+///
+/// Args will specify the length later.
+fn truncate(input: &str) -> Result<String, DeidError> {
+    let n = 10usize;
+    Ok(input.chars().take(n).collect())
+}
+
+/// Convert input to uppercase.
+fn uppercase(input: &str) -> Result<String, DeidError> {
+    Ok(input.to_uppercase())
+}
+
+/// Convert input to lowercase.
+fn lowercase(input: &str) -> Result<String, DeidError> {
+    Ok(input.to_lowercase())
+}
+
+/// Return the input date unchanged.
+///
+/// Full implementation with args will come with CTP translator.
+fn modifydate(input: &str) -> Result<String, DeidError> {
+    Ok(input.to_string())
+}
+
 /// Create a lookup function from a CTP-format lookup table file.
 ///
 /// The table file uses the format `TagName/OriginalValue = NewValue`,
@@ -157,6 +266,18 @@ pub fn default_functions() -> HashMap<String, DeidFunction> {
     map.insert("hashname".into(), Box::new(hashname));
     map.insert("hashdate".into(), Box::new(hashdate));
     map.insert("hashptid".into(), Box::new(hashptid));
+    map.insert("date".into(), Box::new(date));
+    map.insert("time".into(), Box::new(time));
+    map.insert("blank".into(), Box::new(blank));
+    map.insert("round".into(), Box::new(round));
+    map.insert("integer".into(), Box::new(integer));
+    map.insert("initials".into(), Box::new(initials));
+    map.insert("contents".into(), Box::new(contents));
+    map.insert("value".into(), Box::new(value));
+    map.insert("truncate".into(), Box::new(truncate));
+    map.insert("uppercase".into(), Box::new(uppercase));
+    map.insert("lowercase".into(), Box::new(lowercase));
+    map.insert("modifydate".into(), Box::new(modifydate));
     map
 }
 
@@ -336,5 +457,132 @@ mod tests {
         let funcs = create_lookup_function(tmp.path()).unwrap();
         let lookup = &funcs["lookup"];
         assert_eq!(lookup("PatientID/12345").unwrap(), "PatientID/12345");
+    }
+
+    #[test]
+    fn date_returns_yyyymmdd() {
+        let result = date("ignored").unwrap();
+        assert_eq!(result.len(), 8, "date should be 8 chars: {}", result);
+        assert!(
+            result.chars().all(|c| c.is_ascii_digit()),
+            "date should be all digits: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn time_returns_hhmmss() {
+        let result = time("ignored").unwrap();
+        assert_eq!(result.len(), 6, "time should be 6 chars: {}", result);
+        assert!(
+            result.chars().all(|c| c.is_ascii_digit()),
+            "time should be all digits: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn blank_returns_space() {
+        assert_eq!(blank("anything").unwrap(), " ");
+    }
+
+    #[test]
+    fn round_with_suffix() {
+        assert_eq!(round("57Y").unwrap(), "60Y");
+    }
+
+    #[test]
+    fn round_plain_number() {
+        assert_eq!(round("23").unwrap(), "20");
+    }
+
+    #[test]
+    fn round_negative() {
+        assert_eq!(round("-5").unwrap(), "0");
+    }
+
+    #[test]
+    fn integer_five_digits() {
+        let result = integer("test input").unwrap();
+        assert_eq!(result.len(), 5, "integer should be 5 chars: {}", result);
+        assert!(
+            result.chars().all(|c| c.is_ascii_digit()),
+            "integer should be all digits: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn integer_deterministic() {
+        let a = integer("hello").unwrap();
+        let b = integer("hello").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn initials_full_name() {
+        assert_eq!(initials("Doe^John^Michael").unwrap(), "JMD");
+    }
+
+    #[test]
+    fn initials_two_parts() {
+        assert_eq!(initials("Smith^Jane").unwrap(), "JS");
+    }
+
+    #[test]
+    fn contents_identity() {
+        assert_eq!(contents("hello world").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn value_identity() {
+        assert_eq!(value("hello world").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn uppercase_converts() {
+        assert_eq!(uppercase("hello").unwrap(), "HELLO");
+    }
+
+    #[test]
+    fn lowercase_converts() {
+        assert_eq!(lowercase("HELLO").unwrap(), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let input = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(truncate(input).unwrap(), "abcdefghij");
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hi").unwrap(), "hi");
+    }
+
+    #[test]
+    fn modifydate_passthrough() {
+        assert_eq!(modifydate("20210101").unwrap(), "20210101");
+    }
+
+    #[test]
+    fn default_functions_contains_all_new() {
+        let funcs = default_functions();
+        for name in [
+            "date",
+            "time",
+            "blank",
+            "round",
+            "integer",
+            "initials",
+            "contents",
+            "value",
+            "truncate",
+            "uppercase",
+            "lowercase",
+            "modifydate",
+        ] {
+            assert!(funcs.contains_key(name), "missing function: {}", name);
+        }
     }
 }

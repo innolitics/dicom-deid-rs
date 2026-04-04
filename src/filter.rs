@@ -614,6 +614,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Blacklist,
                 labels: vec![FilterLabel {
@@ -645,6 +646,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Blacklist,
                 labels: vec![FilterLabel {
@@ -676,6 +678,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist, // graylist, not blacklist
                 labels: vec![FilterLabel {
@@ -711,6 +714,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
@@ -748,6 +752,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
