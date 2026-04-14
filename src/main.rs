@@ -15,9 +15,10 @@ fn print_usage(program: &str) {
     eprintln!("       {} translate-ctp <anonymizer.xml> [OPTIONS]", program);
     eprintln!();
     eprintln!("Pipeline options:");
-    eprintln!("  --var NAME VALUE       Define a recipe variable (can be repeated)");
-    eprintln!("  --lookup-table PATH    Load a CTP-format lookup table for func:lookup");
-    eprintln!("  --keep-private-tags    Preserve private tags (odd-numbered groups)");
+    eprintln!("  --var NAME VALUE              Define a recipe variable (can be repeated)");
+    eprintln!("  --lookup-table PATH           Load a CTP-format lookup table for func:lookup");
+    eprintln!("  --keep-private-tags           Preserve private tags (odd-numbered groups)");
+    eprintln!("  --remove-unspecified-elements  Remove tags not targeted by any recipe action");
     eprintln!();
     eprintln!("translate-ctp options:");
     eprintln!("  --pixel PATH           CTP pixel anonymizer script");
@@ -42,6 +43,7 @@ fn main() {
     let mut variables: HashMap<String, String> = HashMap::new();
     let mut lookup_table_path: Option<PathBuf> = None;
     let mut remove_private_tags = true;
+    let mut remove_unspecified_elements = false;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -65,6 +67,10 @@ fn main() {
             }
             "--keep-private-tags" => {
                 remove_private_tags = false;
+                i += 1;
+            }
+            "--remove-unspecified-elements" => {
+                remove_unspecified_elements = true;
                 i += 1;
             }
             _ => {
@@ -97,7 +103,7 @@ fn main() {
         variables,
         functions,
         remove_private_tags,
-        remove_unspecified_elements: false,
+        remove_unspecified_elements,
     };
 
     let pipeline = match DeidPipeline::new(config) {
