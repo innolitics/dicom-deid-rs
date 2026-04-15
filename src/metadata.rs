@@ -481,7 +481,8 @@ fn cid_7050_meaning(code: &str) -> &'static str {
 /// Exempt tags/groups:
 /// - SOPClassUID (0008,0016), SOPInstanceUID (0008,0018),
 ///   StudyInstanceUID (0020,000d), TransferSyntaxUID (0002,0010)
-/// - Group 0x0028 (pixel parameters)
+/// - Group 0x0028 (pixel description parameters)
+/// - Group 0x7FE0 (pixel data — PixelData, FloatPixelData, DoublePixelData)
 /// - Groups listed in `recipe.keep_groups`
 /// - Overlay groups (0x6000-0x601e) when the recipe does not REMOVE them
 pub fn remove_unspecified_elements(obj: &mut InMemDicomObject, recipe: &Recipe) {
@@ -503,7 +504,8 @@ pub fn remove_unspecified_elements(obj: &mut InMemDicomObject, recipe: &Recipe) 
 
     // 3. Collect exempt groups
     let mut exempt_groups: HashSet<u16> = HashSet::new();
-    exempt_groups.insert(0x0028); // pixel parameters
+    exempt_groups.insert(0x0028); // pixel description parameters
+    exempt_groups.insert(0x7FE0); // PixelData / FloatPixelData / DoublePixelData
 
     // 4. Add exempt groups from recipe.keep_groups
     let mut skip_odd_groups = false;
@@ -2302,6 +2304,37 @@ mod tests {
             val.as_ref(),
             "ACC-KEEP",
             "KEEP should protect field inside sequence"
+        );
+    }
+
+    /// Regression: `remove_unspecified_elements` must NOT delete PixelData
+    /// (or other group 0x7FE0 bulk-data tags) even when the recipe does not
+    /// explicitly list them. Without this exemption, running a CTP-style
+    /// anonymizer with `unspecifiedelements=T` produced header-only outputs
+    /// with no pixel payload.
+    #[test]
+    fn remove_unspecified_elements_preserves_pixel_data() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ID");
+        // Stand-in pixel payloads in group 0x7FE0.
+        obj.put(dicom_object::mem::InMemElement::new(
+            Tag(0x7FE0, 0x0010),
+            VR::OB,
+            dicom_core::value::PrimitiveValue::from(vec![0u8, 1, 2, 3]),
+        ));
+
+        let empty_recipe = Recipe {
+            format: "dicom".into(),
+            header: vec![],
+            filters: vec![],
+            keep_groups: vec![],
+        };
+
+        remove_unspecified_elements(&mut obj, &empty_recipe);
+
+        assert!(
+            obj.element(Tag(0x7FE0, 0x0010)).is_ok(),
+            "PixelData (7FE0,0010) must be preserved by remove_unspecified_elements"
         );
     }
 

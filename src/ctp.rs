@@ -833,198 +833,387 @@ fn generate_label_from_conditions(conditions: &[(String, String)]) -> String {
 // ---------------------------------------------------------------------------
 // Filter script translation
 // ---------------------------------------------------------------------------
+//
+// The recipe format's per-LABEL evaluator is left-to-right with no operator
+// precedence (`evaluate_conditions` in filter.rs).  CTP filters, by contrast,
+// use proper boolean precedence with arbitrary nesting of `*` (AND), `+` (OR),
+// and `!` (NOT).  To bridge them, the translator parses the CTP filter into
+// an AST, normalizes to negation normal form (NOT pushed into predicates),
+// converts to disjunctive normal form (OR of ANDs), then emits one LABEL per
+// disjunct.  Within each LABEL all conditions are AND-joined (`+` prefix in
+// recipe syntax), which the flat evaluator handles correctly.
+
+/// Soft cap on DNF expansion to avoid pathological blowup.  The Stanford
+/// filter normalizes to ~200 disjuncts; this gives plenty of headroom while
+/// preventing a malformed filter from exhausting memory.
+const MAX_DNF_DISJUNCTS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilterPredicate {
+    negated: bool,
+    tag: String,
+    method: String,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
+enum FilterExpr {
+    Pred(FilterPredicate),
+    Not(Box<FilterExpr>),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+}
 
 fn translate_filter_script(filter_text: &str) -> Vec<String> {
-    let filter_text = filter_text.trim();
-    if filter_text.is_empty() || filter_text == "true." {
+    let trimmed = filter_text.trim();
+    if trimmed.is_empty() || trimmed == "true." {
         return Vec::new();
     }
 
-    let filter_pred_re = Regex::new(
-        "(!?)(\\[[\\d\\w,]+\\]|\\w+)\\.(equals|equalsIgnoreCase|matches|contains|containsIgnoreCase|startsWith|startsWithIgnoreCase|endsWith|endsWithIgnoreCase|isLessThan|isGreaterThan)\\(\"([^\"]*)\"\\)",
-    )
-    .unwrap();
+    let expr = match parse_filter(trimmed) {
+        Ok(expr) => expr,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse filter script ({}); falling back to empty filter",
+                e
+            );
+            return Vec::new();
+        }
+    };
 
-    let stripped = strip_outer_parens(filter_text);
-    let or_groups = split_top_level(&stripped, "+");
+    let nnf = to_nnf(expr, false);
+    let disjuncts = match to_dnf(nnf) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "warning: filter script DNF expansion exceeded cap ({}); falling back to empty filter",
+                e
+            );
+            return Vec::new();
+        }
+    };
 
     let mut lines = Vec::new();
-    for (i, group) in or_groups.iter().enumerate() {
-        let group = strip_outer_parens(group.trim());
-        let conditions = extract_filter_conditions(&group, &filter_pred_re);
-        if conditions.is_empty() {
+    let mut emitted = 0;
+    for conjunct in disjuncts {
+        // A conjunct with no recognized predicates means the original CTP
+        // expression contained only unsupported predicate kinds (e.g.
+        // `.exists()` or `.isBlank()`).  Skip rather than emit an empty
+        // LABEL, which the recipe parser rejects.
+        let preds: Vec<String> = conjunct
+            .iter()
+            .filter_map(emit_predicate)
+            .collect();
+        if preds.is_empty() {
             continue;
         }
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push(format!("LABEL filter_rule_{}", i));
-        for (j, (op, predicate)) in conditions.iter().enumerate() {
-            let prefix = if j == 0 {
-                "  "
-            } else if *op == "and" {
-                "  + "
-            } else {
-                "  || "
-            };
-            lines.push(format!("{}{}", prefix, predicate));
+        lines.push(format!("LABEL filter_rule_{}", emitted));
+        for (j, pred) in preds.iter().enumerate() {
+            let prefix = if j == 0 { "  " } else { "  + " };
+            lines.push(format!("{}{}", prefix, pred));
         }
+        emitted += 1;
     }
-
     lines
 }
 
-fn strip_outer_parens(text: &str) -> String {
-    let mut s = text.trim().to_string();
-    while s.starts_with('(') && matching_paren(&s, 0) == Some(s.len() - 1) {
-        s = s[1..s.len() - 1].trim().to_string();
-    }
-    s
+fn emit_predicate(p: &FilterPredicate) -> Option<String> {
+    let kw = match (p.method.as_str(), p.negated) {
+        ("startsWith" | "startsWithIgnoreCase", false) => "startswith",
+        ("startsWith" | "startsWithIgnoreCase", true) => "notstartswith",
+        ("contains" | "containsIgnoreCase", false) => "contains",
+        ("contains" | "containsIgnoreCase", true) => "notcontains",
+        ("equals" | "equalsIgnoreCase", false) => "equals",
+        ("equals" | "equalsIgnoreCase", true) => "notequals",
+        // No native `endsWith` predicate in the recipe format; approximate
+        // with `contains` (matches CTP semantics conservatively for the
+        // device-vendor filters we care about).
+        ("endsWith" | "endsWithIgnoreCase", false) => "contains",
+        ("endsWith" | "endsWithIgnoreCase", true) => "notcontains",
+        ("matches", false) => "contains",
+        ("matches", true) => "notcontains",
+        // No native numeric predicate — drop so the rest of the conjunct
+        // still applies, matching the behavior of the previous translator.
+        ("isLessThan" | "isGreaterThan", _) => return None,
+        _ => return None,
+    };
+    Some(format!("{} {} {}", kw, p.tag, p.value))
 }
 
-fn matching_paren(text: &str, start: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_quotes = false;
-    for (i, ch) in text[start..].chars().enumerate() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-        } else if !in_quotes {
-            if ch == '(' {
-                depth += 1;
-            } else if ch == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + i);
-                }
-            }
-        }
-    }
-    None
-}
+// --- AST normalization ----------------------------------------------------
 
-fn split_top_level(text: &str, sep: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-    let mut in_quotes = false;
-    let sep_bytes = sep.as_bytes();
-    let text_bytes = text.as_bytes();
-    let mut i = 0;
-
-    while i < text_bytes.len() {
-        let ch = text_bytes[i];
-        if ch == b'"' {
-            in_quotes = !in_quotes;
-            current.push(ch as char);
-        } else if !in_quotes {
-            if ch == b'(' {
-                depth += 1;
-                current.push(ch as char);
-            } else if ch == b')' {
-                depth -= 1;
-                current.push(ch as char);
-            } else if depth == 0 && text_bytes[i..].starts_with(sep_bytes) {
-                parts.push(current.clone());
-                current.clear();
-                i += sep_bytes.len();
-                continue;
+/// Push NOTs down to predicates (negation normal form) so the resulting tree
+/// contains only `And`, `Or`, and `Pred` (with predicate-level negation).
+fn to_nnf(expr: FilterExpr, negate: bool) -> FilterExpr {
+    match expr {
+        FilterExpr::Pred(p) => FilterExpr::Pred(FilterPredicate {
+            negated: if negate { !p.negated } else { p.negated },
+            ..p
+        }),
+        FilterExpr::Not(inner) => to_nnf(*inner, !negate),
+        FilterExpr::And(items) => {
+            let mapped: Vec<_> = items.into_iter().map(|e| to_nnf(e, negate)).collect();
+            if negate {
+                FilterExpr::Or(mapped)
             } else {
-                current.push(ch as char);
+                FilterExpr::And(mapped)
             }
-        } else {
-            current.push(ch as char);
         }
-        i += 1;
+        FilterExpr::Or(items) => {
+            let mapped: Vec<_> = items.into_iter().map(|e| to_nnf(e, negate)).collect();
+            if negate {
+                FilterExpr::And(mapped)
+            } else {
+                FilterExpr::Or(mapped)
+            }
+        }
     }
-    if !current.trim().is_empty() {
-        parts.push(current);
-    }
-    parts
 }
 
-fn extract_filter_conditions(
-    text: &str,
-    pred_re: &Regex,
-) -> Vec<(String, String)> {
-    let and_parts = split_top_level(text, "*");
-    let mut conditions = Vec::new();
-
-    for (i, part) in and_parts.iter().enumerate() {
-        let part = strip_outer_parens(part.trim());
-        let or_subparts = split_top_level(&part, "+");
-
-        if or_subparts.len() > 1 {
-            for (j, subpart) in or_subparts.iter().enumerate() {
-                let subpart = strip_outer_parens(subpart.trim());
-                let preds = extract_predicates_from_atom(&subpart, pred_re);
-                for (k, pred) in preds.iter().enumerate() {
-                    let op = if i == 0 && j == 0 && k == 0 {
-                        "first"
-                    } else if j > 0 && k == 0 {
-                        "or"
-                    } else {
-                        "and"
-                    };
-                    conditions.push((op.to_string(), pred.clone()));
+/// Convert an NNF expression to disjunctive normal form: a vector of
+/// conjunctions, each itself a vector of (possibly negated) predicates.
+fn to_dnf(expr: FilterExpr) -> Result<Vec<Vec<FilterPredicate>>, String> {
+    match expr {
+        FilterExpr::Pred(p) => Ok(vec![vec![p]]),
+        FilterExpr::Not(_) => {
+            // Should not occur after to_nnf
+            Err("internal: NOT survived NNF normalization".to_string())
+        }
+        FilterExpr::Or(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                let child = to_dnf(item)?;
+                out.extend(child);
+                if out.len() > MAX_DNF_DISJUNCTS {
+                    return Err(format!("disjunct count exceeded {}", MAX_DNF_DISJUNCTS));
                 }
             }
-        } else {
-            let preds = extract_predicates_from_atom(&part, pred_re);
-            for (k, pred) in preds.iter().enumerate() {
-                let op = if i == 0 && k == 0 { "first" } else { "and" };
-                conditions.push((op.to_string(), pred.clone()));
+            Ok(out)
+        }
+        FilterExpr::And(items) => {
+            // Cross product: AND(a, b) where a and b are DNFs becomes
+            // OR over { x ++ y | x in a, y in b }.
+            let mut acc: Vec<Vec<FilterPredicate>> = vec![Vec::new()];
+            for child in items {
+                let child_dnf = to_dnf(child)?;
+                if child_dnf.is_empty() {
+                    // Child reduces to FALSE → whole AND is FALSE → empty DNF.
+                    return Ok(Vec::new());
+                }
+                if acc.len().saturating_mul(child_dnf.len()) > MAX_DNF_DISJUNCTS {
+                    return Err(format!("disjunct count exceeded {}", MAX_DNF_DISJUNCTS));
+                }
+                let mut new_acc = Vec::with_capacity(acc.len() * child_dnf.len());
+                for a in &acc {
+                    for c in &child_dnf {
+                        let mut combined = a.clone();
+                        combined.extend(c.iter().cloned());
+                        new_acc.push(combined);
+                    }
+                }
+                acc = new_acc;
+            }
+            Ok(acc)
+        }
+    }
+}
+
+// --- Tokenizer + parser ---------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilterToken {
+    LParen,
+    RParen,
+    Star, // AND
+    Plus, // OR
+    Bang, // NOT
+    Pred(FilterPredicate),
+}
+
+fn parse_filter(text: &str) -> Result<FilterExpr, String> {
+    let tokens = tokenize_filter(text)?;
+    if tokens.is_empty() {
+        return Err("empty filter".to_string());
+    }
+    let mut pos = 0;
+    let expr = parse_or(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        return Err(format!(
+            "unexpected trailing tokens after position {}",
+            pos
+        ));
+    }
+    Ok(expr)
+}
+
+fn parse_or(tokens: &[FilterToken], pos: &mut usize) -> Result<FilterExpr, String> {
+    let first = parse_and(tokens, pos)?;
+    let mut items = vec![first];
+    while matches!(tokens.get(*pos), Some(FilterToken::Plus)) {
+        *pos += 1;
+        items.push(parse_and(tokens, pos)?);
+    }
+    Ok(if items.len() == 1 {
+        items.pop().unwrap()
+    } else {
+        FilterExpr::Or(items)
+    })
+}
+
+fn parse_and(tokens: &[FilterToken], pos: &mut usize) -> Result<FilterExpr, String> {
+    let first = parse_unary(tokens, pos)?;
+    let mut items = vec![first];
+    while matches!(tokens.get(*pos), Some(FilterToken::Star)) {
+        *pos += 1;
+        items.push(parse_unary(tokens, pos)?);
+    }
+    Ok(if items.len() == 1 {
+        items.pop().unwrap()
+    } else {
+        FilterExpr::And(items)
+    })
+}
+
+fn parse_unary(tokens: &[FilterToken], pos: &mut usize) -> Result<FilterExpr, String> {
+    if matches!(tokens.get(*pos), Some(FilterToken::Bang)) {
+        *pos += 1;
+        let inner = parse_unary(tokens, pos)?;
+        Ok(FilterExpr::Not(Box::new(inner)))
+    } else {
+        parse_atom(tokens, pos)
+    }
+}
+
+fn parse_atom(tokens: &[FilterToken], pos: &mut usize) -> Result<FilterExpr, String> {
+    match tokens.get(*pos) {
+        Some(FilterToken::LParen) => {
+            *pos += 1;
+            let inner = parse_or(tokens, pos)?;
+            match tokens.get(*pos) {
+                Some(FilterToken::RParen) => {
+                    *pos += 1;
+                    Ok(inner)
+                }
+                other => Err(format!("expected ')' at token {}, got {:?}", pos, other)),
+            }
+        }
+        Some(FilterToken::Pred(p)) => {
+            *pos += 1;
+            Ok(FilterExpr::Pred(p.clone()))
+        }
+        other => Err(format!("expected predicate or '(' at token {}, got {:?}", pos, other)),
+    }
+}
+
+fn tokenize_filter(text: &str) -> Result<Vec<FilterToken>, String> {
+    // Predicate without leading `!` (NOT is its own token here).  Tag is a
+    // `[group,element]` literal or a top-level keyword — sequence paths
+    // (`SeqOfX::Field.method(...)`) are handled by the unknown-predicate
+    // fallback below because the recipe format doesn't address nested
+    // sequence items.
+    let pred_re = Regex::new(
+        r#"^(\[[\dA-Fa-f,]+\]|\w+)\.(equals|equalsIgnoreCase|matches|contains|containsIgnoreCase|startsWith|startsWithIgnoreCase|endsWith|endsWithIgnoreCase|isLessThan|isGreaterThan)\("([^"]*)"\)"#,
+    )
+    .map_err(|e| format!("predicate regex compile failed: {}", e))?;
+    // Consume the full lexeme of any predicate-like atom that is NOT in the
+    // supported set (e.g. `[0042,0011].exists()`) or that addresses a
+    // sequence path (`SeqOfX::Field.equals(...)`), so the outer parser
+    // doesn't choke on it.  The atom is dropped — yielding TRUE in the
+    // surrounding conjunction, matching the previous translator's behavior
+    // of silently skipping unknown predicates.
+    let unknown_pred_re = Regex::new(r#"^(\[[\dA-Fa-f,]+\]|\w+(?:::\w+)*)\.\w+\([^)]*\)"#)
+        .map_err(|e| format!("unknown-predicate regex compile failed: {}", e))?;
+
+    let mut tokens = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+        match ch {
+            ' ' | '\t' | '\n' | '\r' => i += 1,
+            '/' if i + 1 < bytes.len() && bytes[i + 1] as char == '/' => {
+                // Line comment — skip to end of line.
+                while i < bytes.len() && bytes[i] as char != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < bytes.len() && bytes[i + 1] as char == '*' => {
+                // Block comment — skip until `*/`.
+                i += 2;
+                while i + 1 < bytes.len()
+                    && !(bytes[i] as char == '*' && bytes[i + 1] as char == '/')
+                {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            '(' => {
+                tokens.push(FilterToken::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(FilterToken::RParen);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(FilterToken::Star);
+                i += 1;
+            }
+            '+' => {
+                tokens.push(FilterToken::Plus);
+                i += 1;
+            }
+            '!' => {
+                tokens.push(FilterToken::Bang);
+                i += 1;
+            }
+            _ => {
+                let rest = &text[i..];
+                if let Some(caps) = pred_re.captures(rest) {
+                    let full_match = caps.get(0).unwrap().as_str();
+                    let tag_raw = caps.get(1).unwrap().as_str();
+                    let method = caps.get(2).unwrap().as_str().to_string();
+                    let value = caps.get(3).unwrap().as_str().to_string();
+                    let tag = if tag_raw.starts_with('[') && tag_raw.ends_with(']') {
+                        tag_raw[1..tag_raw.len() - 1].replace(',', "")
+                    } else {
+                        tag_raw.to_string()
+                    };
+                    tokens.push(FilterToken::Pred(FilterPredicate {
+                        negated: false,
+                        tag,
+                        method,
+                        value,
+                    }));
+                    i += full_match.len();
+                } else if let Some(caps) = unknown_pred_re.captures(rest) {
+                    // Unrecognized predicate kind: synthesize a tautology so
+                    // the surrounding boolean structure still parses.  We
+                    // model "always TRUE" as `Or([])` would be FALSE — instead
+                    // emit a pseudo-predicate that emit_predicate filters out,
+                    // then collapse via FilterExpr::And([]) which DNF treats
+                    // as TRUE.
+                    let full_match = caps.get(0).unwrap().as_str();
+                    tokens.push(FilterToken::Pred(FilterPredicate {
+                        negated: false,
+                        tag: String::new(),
+                        method: "__unsupported__".to_string(),
+                        value: String::new(),
+                    }));
+                    i += full_match.len();
+                } else {
+                    return Err(format!(
+                        "unexpected character {:?} at position {}",
+                        ch, i
+                    ));
+                }
             }
         }
     }
-
-    conditions
-}
-
-fn extract_predicates_from_atom(text: &str, pred_re: &Regex) -> Vec<String> {
-    let mut results = Vec::new();
-    for caps in pred_re.captures_iter(text) {
-        let negated = &caps[1] == "!";
-        let tag_raw = &caps[2];
-        let method = &caps[3];
-        let value = &caps[4];
-
-        let tag = if tag_raw.starts_with('[') && tag_raw.ends_with(']') {
-            tag_raw[1..tag_raw.len() - 1].replace(',', "")
-        } else {
-            tag_raw.to_string()
-        };
-
-        let pred = match method {
-            "startsWith" | "startsWithIgnoreCase" => {
-                let kw = if negated { "notstartswith" } else { "startswith" };
-                format!("{} {} {}", kw, tag, value)
-            }
-            "contains" | "containsIgnoreCase" => {
-                let kw = if negated { "notcontains" } else { "contains" };
-                format!("{} {} {}", kw, tag, value)
-            }
-            "equals" | "equalsIgnoreCase" => {
-                let kw = if negated { "notequals" } else { "equals" };
-                format!("{} {} {}", kw, tag, value)
-            }
-            "endsWith" | "endsWithIgnoreCase" => {
-                // Approximate with contains
-                let kw = if negated { "notcontains" } else { "contains" };
-                format!("{} {} {}", kw, tag, value)
-            }
-            "matches" => {
-                let kw = if negated { "notcontains" } else { "contains" };
-                format!("{} {} {}", kw, tag, value)
-            }
-            "isLessThan" | "isGreaterThan" => {
-                // No direct equivalent — skip
-                continue;
-            }
-            _ => continue,
-        };
-        results.push(pred);
-    }
-    results
+    Ok(tokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,6 +1586,138 @@ mod tests {
         let lines = translate_filter_script(filter);
         assert!(!lines.is_empty());
         assert!(lines.iter().any(|l| l.contains("notcontains")));
+    }
+
+    /// Distribution of AND over OR: `A * (B + C)` must expand to TWO
+    /// LABELs, `A AND B` and `A AND C`, so the flat evaluator sees a correct
+    /// conjunction per disjunct.
+    #[test]
+    fn translate_filter_distributes_and_over_or() {
+        let filter = r#"
+            Manufacturer.containsIgnoreCase("GE")
+            * (
+                Modality.equals("CT")
+                + Modality.equals("MR")
+              )
+        "#;
+        let lines = translate_filter_script(filter);
+        let labels: Vec<&String> = lines.iter().filter(|l| l.starts_with("LABEL")).collect();
+        assert_eq!(labels.len(), 2, "expected two disjuncts after distribution");
+
+        let joined = lines.join("\n");
+        // First disjunct: Manufacturer GE AND Modality CT
+        assert!(joined.contains("contains Manufacturer GE"));
+        assert!(joined.contains("equals Modality CT"));
+        // Second disjunct: Manufacturer GE AND Modality MR
+        assert!(joined.contains("equals Modality MR"));
+        // The Manufacturer predicate must be present in BOTH disjuncts, not
+        // just OR'd at the top — split text around LABEL markers to verify.
+        let sections: Vec<&str> = joined.split("LABEL filter_rule_").skip(1).collect();
+        assert_eq!(sections.len(), 2);
+        for sec in &sections {
+            assert!(
+                sec.contains("contains Manufacturer GE"),
+                "Manufacturer condition must be repeated in each disjunct, got:\n{}",
+                sec
+            );
+        }
+    }
+
+    /// Stanford-style nested OR inside AND: `A * B * C * (D + E)` must
+    /// expand to two LABELs, each requiring A, B, C plus one alternative.
+    #[test]
+    fn translate_filter_preserves_nested_alternatives() {
+        let filter = r#"
+            Manufacturer.containsIgnoreCase("KONICA")
+            * Modality.startsWithIgnoreCase("CR")
+            * ManufacturerModelName.containsIgnoreCase("0402")
+            * (
+                Rows.equalsIgnoreCase("2446")
+                + Rows.equalsIgnoreCase("2010")
+              )
+        "#;
+        let lines = translate_filter_script(filter);
+        let labels: Vec<&String> = lines.iter().filter(|l| l.starts_with("LABEL")).collect();
+        assert_eq!(labels.len(), 2);
+
+        let joined = lines.join("\n");
+        // Each disjunct must contain all three prerequisite predicates.
+        let sections: Vec<&str> = joined.split("LABEL filter_rule_").skip(1).collect();
+        assert_eq!(sections.len(), 2);
+        for sec in &sections {
+            assert!(sec.contains("contains Manufacturer KONICA"));
+            assert!(sec.contains("startswith Modality CR"));
+            assert!(sec.contains("contains ManufacturerModelName 0402"));
+        }
+        // Disjunct 1 has Rows=2446, disjunct 2 has Rows=2010 — and neither
+        // has both simultaneously (that was the old bug).
+        assert!(sections[0].contains("equals Rows 2446"));
+        assert!(!sections[0].contains("equals Rows 2010"));
+        assert!(sections[1].contains("equals Rows 2010"));
+        assert!(!sections[1].contains("equals Rows 2446"));
+    }
+
+    /// Top-level OR produces one LABEL per alternative.
+    #[test]
+    fn translate_filter_top_level_or() {
+        let filter = r#"
+            Manufacturer.containsIgnoreCase("GE")
+            + Manufacturer.containsIgnoreCase("SIEMENS")
+            + Manufacturer.containsIgnoreCase("PHILIPS")
+        "#;
+        let lines = translate_filter_script(filter);
+        let labels: Vec<&String> = lines.iter().filter(|l| l.starts_with("LABEL")).collect();
+        assert_eq!(labels.len(), 3);
+    }
+
+    /// NOT over a parenthesized expression is pushed down via De Morgan.
+    #[test]
+    fn translate_filter_negates_parenthesized_group() {
+        let filter = r#"!(Modality.equals("CT") + Modality.equals("MR"))"#;
+        let lines = translate_filter_script(filter);
+        // !(CT OR MR) => notCT AND notMR => one LABEL with two negated preds.
+        let labels: Vec<&String> = lines.iter().filter(|l| l.starts_with("LABEL")).collect();
+        assert_eq!(labels.len(), 1);
+        let joined = lines.join("\n");
+        assert!(joined.contains("notequals Modality CT"));
+        assert!(joined.contains("notequals Modality MR"));
+    }
+
+    /// Double-negation cancels out.
+    #[test]
+    fn translate_filter_double_negation() {
+        let filter = r#"!(!Modality.equals("CT"))"#;
+        let lines = translate_filter_script(filter);
+        let joined = lines.join("\n");
+        assert!(joined.contains("equals Modality CT"));
+        assert!(!joined.contains("notequals"));
+    }
+
+    /// Comments in the CTP filter are skipped during tokenization.
+    #[test]
+    fn translate_filter_skips_comments() {
+        let filter = r#"
+            // leading comment
+            Modality.equals("CT")  // trailing comment
+            /* block comment with * and + inside */
+            * Manufacturer.containsIgnoreCase("GE")
+        "#;
+        let lines = translate_filter_script(filter);
+        let joined = lines.join("\n");
+        assert!(joined.contains("equals Modality CT"));
+        assert!(joined.contains("contains Manufacturer GE"));
+    }
+
+    /// Unsupported predicate kinds (e.g. `.exists()`) are silently dropped
+    /// from the conjunction, matching the previous translator's behavior.
+    #[test]
+    fn translate_filter_drops_unsupported_predicates() {
+        let filter = r#"Modality.equals("CT") * [0042,0011].exists()"#;
+        let lines = translate_filter_script(filter);
+        let joined = lines.join("\n");
+        assert!(joined.contains("equals Modality CT"));
+        // `.exists()` is not supported; we don't emit a predicate for it.
+        assert!(!joined.contains("exists"));
     }
 
     // --- Pixel script translation test ---
