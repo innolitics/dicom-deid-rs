@@ -568,10 +568,13 @@ fn parse_predicate(text: &str) -> Result<Predicate, DeidError> {
 }
 
 fn split_field_value(text: &str) -> Result<(String, String), DeidError> {
-    let (field, value) = text.split_once(' ').ok_or_else(|| {
-        DeidError::RecipeParse(format!("expected field and value in predicate: {}", text))
-    })?;
-    Ok((field.to_string(), value.trim().to_string()))
+    // When the value is absent (no space after the field name), treat it
+    // as an empty string.  This matches CTP's `.equals("")` semantics when
+    // translated — the field is tested against an empty value.
+    match text.split_once(' ') {
+        Some((field, value)) => Ok((field.to_string(), value.trim().to_string())),
+        None => Ok((text.to_string(), String::new())),
+    }
 }
 
 fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {

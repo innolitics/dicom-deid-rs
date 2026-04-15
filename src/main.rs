@@ -22,7 +22,8 @@ fn print_usage(program: &str) {
     eprintln!();
     eprintln!("translate-ctp options:");
     eprintln!("  --pixel PATH           CTP pixel anonymizer script");
-    eprintln!("  --filter PATH          CTP filter script");
+    eprintln!("  --filter PATH          CTP filter script (whitelist)");
+    eprintln!("  --blacklist PATH       CTP filter script for blacklist (reject matching)");
     eprintln!("  -o, --output PATH      Write recipe to file (default: stdout)");
 }
 
@@ -137,6 +138,7 @@ fn run_translate_ctp(args: &[String]) {
     let anonymizer_path = &args[2];
     let mut pixel_path: Option<String> = None;
     let mut filter_path: Option<String> = None;
+    let mut blacklist_path: Option<String> = None;
     let mut output_path: Option<String> = None;
 
     let mut i = 3;
@@ -156,6 +158,14 @@ fn run_translate_ctp(args: &[String]) {
                     process::exit(1);
                 }
                 filter_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--blacklist" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --blacklist requires a PATH argument");
+                    process::exit(1);
+                }
+                blacklist_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "-o" | "--output" => {
@@ -192,10 +202,18 @@ fn run_translate_ctp(args: &[String]) {
         })
     });
 
-    let result = ctp::translate_ctp_scripts(
+    let blacklist_text = blacklist_path.map(|p| {
+        fs::read_to_string(&p).unwrap_or_else(|e| {
+            eprintln!("Error reading {}: {}", p, e);
+            process::exit(1);
+        })
+    });
+
+    let result = ctp::translate_ctp_scripts_with_blacklist(
         Some(&anonymizer_xml),
         pixel_text.as_deref(),
         filter_text.as_deref(),
+        blacklist_text.as_deref(),
     )
     .unwrap_or_else(|e| {
         eprintln!("Error translating CTP scripts: {}", e);

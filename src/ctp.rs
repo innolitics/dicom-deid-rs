@@ -32,6 +32,21 @@ pub fn translate_ctp_scripts(
     pixel_script: Option<&str>,
     filter_script: Option<&str>,
 ) -> Result<TranslationResult, DeidError> {
+    translate_ctp_scripts_with_blacklist(anonymizer_xml, pixel_script, filter_script, None)
+}
+
+/// Translate CTP scripts into a dicom-deid-rs recipe, with a separate blacklist filter.
+///
+/// The *blacklist_script* is emitted as a `%filter blacklist` section — files
+/// matching it are rejected.  Combining a whitelist `filter_script` with a
+/// blacklist gives CTP's "whitelist AND NOT blacklist" semantics without
+/// trying to fold both into a single recipe expression.
+pub fn translate_ctp_scripts_with_blacklist(
+    anonymizer_xml: Option<&str>,
+    pixel_script: Option<&str>,
+    filter_script: Option<&str>,
+    blacklist_script: Option<&str>,
+) -> Result<TranslationResult, DeidError> {
     let mut output = String::from("FORMAT dicom\n");
     let mut variables = HashMap::new();
     let mut remove_private_tags = true;
@@ -42,6 +57,15 @@ pub fn translate_ctp_scripts(
         if !filter_lines.is_empty() {
             output.push_str("\n%filter whitelist\n\n");
             output.push_str(&filter_lines.join("\n"));
+            output.push('\n');
+        }
+    }
+
+    if let Some(blacklist_text) = blacklist_script {
+        let blacklist_lines = translate_filter_script(blacklist_text);
+        if !blacklist_lines.is_empty() {
+            output.push_str("\n%filter blacklist\n\n");
+            output.push_str(&blacklist_lines.join("\n"));
             output.push('\n');
         }
     }
