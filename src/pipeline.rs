@@ -30,6 +30,12 @@ pub struct DeidConfig {
     /// after processing.  Exempt: SOPClassUID, SOPInstanceUID,
     /// StudyInstanceUID, group 0028, and any keep-groups from the recipe.
     pub remove_unspecified_elements: bool,
+    /// When set, files that are blacklisted or fail to parse are copied
+    /// into this directory (preserving the relative path from
+    /// `input_dir`), and the `blacklisted_files.txt` report is written
+    /// here instead of `output_dir`.  When `None`, no copies are made and
+    /// the report lands in `output_dir` for backward compatibility.
+    pub quarantine_dir: Option<PathBuf>,
 }
 
 /// Summary report after de-identification completes.
@@ -37,6 +43,12 @@ pub struct DeidReport {
     pub files_processed: usize,
     pub files_skipped: usize,
     pub files_blacklisted: usize,
+    /// Files that were blacklisted/skipped but could not be copied into the
+    /// quarantine directory (disk full, permission denied, etc.).  The file
+    /// is still counted as quarantined for the purposes of
+    /// `files_blacklisted` / `files_skipped`; this field surfaces the
+    /// persistence failure for downstream reporting.
+    pub files_quarantine_copy_failed: usize,
 }
 
 /// The main de-identification pipeline.
@@ -219,6 +231,7 @@ impl DeidPipeline {
             files_processed: 0,
             files_skipped: 0,
             files_blacklisted: 0,
+            files_quarantine_copy_failed: 0,
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
         let mut audit_entries: Vec<AuditEntry> = Vec::new();
@@ -236,6 +249,14 @@ impl DeidPipeline {
                         .unwrap_or(file_path);
                     blacklisted_files.push((relative.to_path_buf(), reason));
                     report.files_blacklisted += 1;
+                    if let Err(e) = self.copy_to_quarantine(file_path) {
+                        eprintln!(
+                            "Warning: failed to copy {} to quarantine: {}",
+                            file_path.display(),
+                            e
+                        );
+                        report.files_quarantine_copy_failed += 1;
+                    }
                 }
                 Err(e) => {
                     let msg = format!("Warning: skipping {}: {}", file_path.display(), e);
@@ -244,6 +265,14 @@ impl DeidPipeline {
                     }
                     eprintln!("{}", msg);
                     report.files_skipped += 1;
+                    if let Err(e) = self.copy_to_quarantine(file_path) {
+                        eprintln!(
+                            "Warning: failed to copy {} to quarantine: {}",
+                            file_path.display(),
+                            e
+                        );
+                        report.files_quarantine_copy_failed += 1;
+                    }
                 }
             }
             if let Some(ref pb) = pb {
@@ -337,6 +366,7 @@ impl DeidPipeline {
             files_processed: 0,
             files_skipped: 0,
             files_blacklisted: 0,
+            files_quarantine_copy_failed: 0,
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
         let mut audit_entries: Vec<AuditEntry> = Vec::new();
@@ -353,10 +383,26 @@ impl DeidPipeline {
                         .unwrap_or(file_path);
                     blacklisted_files.push((relative.to_path_buf(), reason));
                     report.files_blacklisted += 1;
+                    if let Err(e) = self.copy_to_quarantine(file_path) {
+                        eprintln!(
+                            "Warning: failed to copy {} to quarantine: {}",
+                            file_path.display(),
+                            e
+                        );
+                        report.files_quarantine_copy_failed += 1;
+                    }
                 }
                 Err(e) => {
                     eprintln!("Warning: skipping {}: {}", file_path.display(), e);
                     report.files_skipped += 1;
+                    if let Err(e) = self.copy_to_quarantine(file_path) {
+                        eprintln!(
+                            "Warning: failed to copy {} to quarantine: {}",
+                            file_path.display(),
+                            e
+                        );
+                        report.files_quarantine_copy_failed += 1;
+                    }
                 }
             }
             on_progress(
@@ -400,6 +446,8 @@ impl DeidPipeline {
 
         let audit_entries: std::sync::Mutex<Vec<AuditEntry>> = std::sync::Mutex::new(Vec::new());
 
+        let quarantine_copy_failed = AtomicUsize::new(0);
+
         pool.install(|| {
             files.par_iter().for_each(|file_path| {
                 match self.process_file(file_path) {
@@ -416,10 +464,26 @@ impl DeidPipeline {
                             .unwrap()
                             .push((relative.to_path_buf(), reason));
                         blacklisted_count.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = self.copy_to_quarantine(file_path) {
+                            eprintln!(
+                                "Warning: failed to copy {} to quarantine: {}",
+                                file_path.display(),
+                                e
+                            );
+                            quarantine_copy_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Warning: skipping {}: {}", file_path.display(), e);
                         skipped.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = self.copy_to_quarantine(file_path) {
+                            eprintln!(
+                                "Warning: failed to copy {} to quarantine: {}",
+                                file_path.display(),
+                                e
+                            );
+                            quarantine_copy_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 on_progress(
@@ -442,17 +506,44 @@ impl DeidPipeline {
             files_processed: processed.into_inner(),
             files_skipped: skipped.into_inner(),
             files_blacklisted: blacklisted_count.into_inner(),
+            files_quarantine_copy_failed: quarantine_copy_failed.into_inner(),
         })
     }
 
     fn write_blacklist_report(&self, blacklisted: &[(PathBuf, String)]) -> Result<(), DeidError> {
-        fs::create_dir_all(&self.config.output_dir)?;
-        let report_path = self.config.output_dir.join("blacklisted_files.txt");
+        // Prefer the quarantine directory so the report sits alongside the
+        // files it describes; fall back to output_dir for backward
+        // compatibility when no quarantine_dir is configured.
+        let dest_dir = self
+            .config
+            .quarantine_dir
+            .as_deref()
+            .unwrap_or(&self.config.output_dir);
+        fs::create_dir_all(dest_dir)?;
+        let report_path = dest_dir.join("blacklisted_files.txt");
         let mut lines = Vec::with_capacity(blacklisted.len());
         for (path, reason) in blacklisted {
             lines.push(format!("{}\t{}", path.display(), reason));
         }
         fs::write(&report_path, lines.join("\n") + "\n")?;
+        Ok(())
+    }
+
+    /// Copy a source file to the configured quarantine directory, preserving
+    /// its path relative to `input_dir`.  Returns `Ok(())` when no quarantine
+    /// directory is configured (no-op).
+    fn copy_to_quarantine(&self, file_path: &Path) -> Result<(), DeidError> {
+        let Some(quarantine_dir) = &self.config.quarantine_dir else {
+            return Ok(());
+        };
+        let relative = file_path
+            .strip_prefix(&self.config.input_dir)
+            .unwrap_or(file_path);
+        let dest = quarantine_dir.join(relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(file_path, &dest)?;
         Ok(())
     }
 
@@ -630,6 +721,7 @@ mod tests {
             functions: HashMap::new(),
             remove_private_tags: true,
             remove_unspecified_elements: false,
+            quarantine_dir: None,
         };
         assert_eq!(config.input_dir, PathBuf::from("/tmp/input"));
         assert_eq!(config.output_dir, PathBuf::from("/tmp/output"));
@@ -781,6 +873,7 @@ mod tests {
             functions: HashMap::new(),
             remove_private_tags: true,
             remove_unspecified_elements: false,
+            quarantine_dir: None,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -892,6 +985,7 @@ mod tests {
             functions: HashMap::new(),
             remove_private_tags: true,
             remove_unspecified_elements: false,
+            quarantine_dir: None,
         };
 
         let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -975,6 +1069,7 @@ mod tests {
             functions: HashMap::new(),
             remove_private_tags: true,
             remove_unspecified_elements: false,
+            quarantine_dir: None,
         };
 
         let pipeline =
@@ -996,5 +1091,217 @@ mod tests {
             .to_str()
             .expect("should read value");
         assert_eq!(val.as_ref(), "ANON");
+    }
+
+    // -- quarantine-dir regression -------------------------------------------
+
+    /// Build a minimal valid DICOM at `path` with the tags needed for routing.
+    fn write_test_dicom(path: &Path, modality: &str) {
+        use crate::test_helpers::*;
+        let mut file_obj = create_test_file_obj();
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_NAME,
+            dicom_core::VR::PN,
+            "Test^Patient",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::PATIENT_ID,
+            dicom_core::VR::LO,
+            "PID123",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::MODALITY,
+            dicom_core::VR::CS,
+            modality,
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::STUDY_DATE,
+            dicom_core::VR::DA,
+            "20250101",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SERIES_NUMBER,
+            dicom_core::VR::IS,
+            "1",
+        );
+        put_str(
+            &mut file_obj,
+            dicom_dictionary_std::tags::SOP_INSTANCE_UID,
+            dicom_core::VR::UI,
+            "1.2.3",
+        );
+        file_obj.write_to_file(path).expect("write test DICOM");
+    }
+
+    /// A file matched by the recipe blacklist is copied into `quarantine_dir`
+    /// at the same relative path as under `input_dir`.
+    #[test]
+    fn blacklisted_files_are_copied_to_quarantine_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        let quarantine_dir = tmp.path().join("quarantine");
+        fs::create_dir_all(input_dir.join("sub")).expect("mkdir");
+
+        // Two files, both CT — both will match the blacklist below.
+        write_test_dicom(&input_dir.join("a.dcm"), "CT");
+        write_test_dicom(&input_dir.join("sub").join("b.dcm"), "CT");
+
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(
+            &recipe_path,
+            "FORMAT dicom\n%filter blacklist\nLABEL reject_ct\n  equals Modality CT\n",
+        )
+        .expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir: input_dir.clone(),
+            output_dir,
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: true,
+            remove_unspecified_elements: false,
+            quarantine_dir: Some(quarantine_dir.clone()),
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("pipeline");
+        let report = pipeline.run().expect("run");
+
+        assert_eq!(report.files_blacklisted, 2);
+        assert_eq!(report.files_processed, 0);
+        assert_eq!(report.files_quarantine_copy_failed, 0);
+        assert!(
+            quarantine_dir.join("a.dcm").exists(),
+            "a.dcm should be copied into quarantine root"
+        );
+        assert!(
+            quarantine_dir.join("sub").join("b.dcm").exists(),
+            "b.dcm should preserve its relative sub/ path"
+        );
+    }
+
+    /// A non-DICOM `.dcm` file is counted as skipped (parse failure) and
+    /// also copied into `quarantine_dir`.
+    #[test]
+    fn skipped_files_are_copied_to_quarantine_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        let quarantine_dir = tmp.path().join("quarantine");
+        fs::create_dir_all(&input_dir).expect("mkdir");
+
+        // A file with .dcm extension but non-DICOM contents → open_file fails.
+        let bad = input_dir.join("garbage.dcm");
+        fs::write(&bad, b"this is not DICOM").expect("write");
+
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(&recipe_path, "FORMAT dicom\n").expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir: input_dir.clone(),
+            output_dir,
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: true,
+            remove_unspecified_elements: false,
+            quarantine_dir: Some(quarantine_dir.clone()),
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("pipeline");
+        let report = pipeline.run().expect("run");
+
+        assert_eq!(report.files_skipped, 1);
+        assert_eq!(report.files_processed, 0);
+        assert_eq!(report.files_quarantine_copy_failed, 0);
+        assert!(
+            quarantine_dir.join("garbage.dcm").exists(),
+            "garbage.dcm should be copied into quarantine"
+        );
+    }
+
+    /// When a quarantine_dir is configured, `blacklisted_files.txt` lives
+    /// in the quarantine dir (not in output_dir).
+    #[test]
+    fn blacklist_report_written_to_quarantine_dir_when_configured() {
+        let tmp = TempDir::new().expect("tmp");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        let quarantine_dir = tmp.path().join("quarantine");
+        fs::create_dir_all(&input_dir).expect("mkdir");
+        write_test_dicom(&input_dir.join("a.dcm"), "CT");
+
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(
+            &recipe_path,
+            "FORMAT dicom\n%filter blacklist\nLABEL reject_ct\n  equals Modality CT\n",
+        )
+        .expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: true,
+            remove_unspecified_elements: false,
+            quarantine_dir: Some(quarantine_dir.clone()),
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("pipeline");
+        pipeline.run().expect("run");
+
+        assert!(
+            quarantine_dir.join("blacklisted_files.txt").exists(),
+            "report should live in quarantine_dir"
+        );
+        assert!(
+            !output_dir.join("blacklisted_files.txt").exists(),
+            "report should NOT be written to output_dir when quarantine_dir is set"
+        );
+    }
+
+    /// Without a quarantine_dir, the report falls back to output_dir
+    /// (backward-compat guarantee for direct library consumers).
+    #[test]
+    fn blacklist_report_falls_back_to_output_dir() {
+        let tmp = TempDir::new().expect("tmp");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("mkdir");
+        write_test_dicom(&input_dir.join("a.dcm"), "CT");
+
+        let recipe_path = tmp.path().join("recipe.txt");
+        fs::write(
+            &recipe_path,
+            "FORMAT dicom\n%filter blacklist\nLABEL reject_ct\n  equals Modality CT\n",
+        )
+        .expect("write recipe");
+
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path,
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: true,
+            remove_unspecified_elements: false,
+            quarantine_dir: None,
+        };
+
+        let pipeline = DeidPipeline::new(config).expect("pipeline");
+        pipeline.run().expect("run");
+
+        assert!(
+            output_dir.join("blacklisted_files.txt").exists(),
+            "report should still land in output_dir when no quarantine_dir is set"
+        );
     }
 }

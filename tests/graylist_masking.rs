@@ -54,6 +54,7 @@ fn run_pipeline_on_fixture(
         functions: HashMap::new(),
         remove_private_tags: true,
         remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
