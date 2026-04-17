@@ -442,18 +442,14 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             };
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
-        Predicate::Missing { field } => obj.element_by_name(field).is_err(),
-        Predicate::Empty { field } => match obj.element_by_name(field) {
-            Ok(elem) => match elem.value() {
-                dicom_core::value::Value::Primitive(prim) => match prim {
-                    dicom_core::value::PrimitiveValue::Empty => true,
-                    _ => elem.value().to_str().map(|s| s.is_empty()).unwrap_or(true),
-                },
-                _ => false,
-            },
-            Err(_) => false,
-        },
-        Predicate::Present { field } => obj.element_by_name(field).is_ok(),
+        Predicate::Missing { field } => !crate::filter::field_present(obj, field),
+        Predicate::Empty { field } => {
+            match crate::filter::get_field_string(obj, field) {
+                Some(s) => s.is_empty(),
+                None => false,
+            }
+        }
+        Predicate::Present { field } => crate::filter::field_present(obj, field),
     }
 }
 

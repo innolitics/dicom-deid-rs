@@ -1,15 +1,63 @@
 use crate::recipe::{
     Condition, CoordinateRegion, FilterLabel, FilterType, LogicalOp, Predicate, Recipe,
 };
+use crate::tag::{parse_bare_hex_tag, parse_parenthesized_tag};
+use dicom_core::Tag;
 use dicom_core::value::PrimitiveValue;
 use dicom_object::InMemDicomObject;
 use regex::Regex;
 
+/// Parse a field identifier as a DICOM tag if it looks like one.
+///
+/// Accepts the three formats the filter translator may emit:
+/// - `00081090`          (bare 8-hex-digit)
+/// - `0008,1090`         (comma-separated)
+/// - `(0008,1090)`       (parenthesized)
+///
+/// Returns `None` for keyword-style field names (which are resolved via
+/// `obj.element_by_name`).
+fn field_as_tag(field: &str) -> Option<Tag> {
+    if field.starts_with('(') {
+        return parse_parenthesized_tag(field).ok();
+    }
+    if let Some((g, e)) = field.split_once(',') {
+        if let (Ok(group), Ok(element)) =
+            (u16::from_str_radix(g.trim(), 16), u16::from_str_radix(e.trim(), 16))
+        {
+            return Some(Tag(group, element));
+        }
+    }
+    parse_bare_hex_tag(field).ok()
+}
+
+/// Look up a DICOM element by keyword, falling back to a hex-tag lookup when
+/// the field is a bare `GGGGEEEE` / `GGGG,EEEE` / `(GGGG,EEEE)` tag literal.
+///
+/// The CTP filter translator emits hex tag IDs (e.g. `00081090`) for any
+/// `[GGGG,EEEE]` reference in the source script; those have no DICOM keyword,
+/// so `element_by_name` alone would never resolve them.
+fn resolve_element<'a>(
+    obj: &'a InMemDicomObject,
+    field: &str,
+) -> Option<&'a dicom_object::mem::InMemElement<dicom_dictionary_std::StandardDataDictionary>> {
+    if let Ok(elem) = obj.element_by_name(field) {
+        return Some(elem);
+    }
+    if let Some(tag) = field_as_tag(field) {
+        return obj.element(tag).ok();
+    }
+    None
+}
+
 /// Resolve a DICOM field value as a string, returning None if the field is missing.
 pub fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
-    obj.element_by_name(field)
-        .ok()
+    resolve_element(obj, field)
         .and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
+}
+
+/// Return `true` when the field resolves to an element in the object.
+pub fn field_present(obj: &InMemDicomObject, field: &str) -> bool {
+    resolve_element(obj, field).is_some()
 }
 
 /// Evaluate a single filter predicate against a DICOM object.
@@ -61,18 +109,18 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             };
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
-        Predicate::Missing { field } => obj.element_by_name(field).is_err(),
-        Predicate::Empty { field } => match obj.element_by_name(field) {
-            Ok(elem) => match elem.value() {
+        Predicate::Missing { field } => !field_present(obj, field),
+        Predicate::Empty { field } => match resolve_element(obj, field) {
+            Some(elem) => match elem.value() {
                 dicom_core::value::Value::Primitive(prim) => match prim {
                     PrimitiveValue::Empty => true,
                     _ => elem.value().to_str().map(|s| s.is_empty()).unwrap_or(true),
                 },
                 _ => false,
             },
-            Err(_) => false,
+            None => false,
         },
-        Predicate::Present { field } => obj.element_by_name(field).is_ok(),
+        Predicate::Present { field } => field_present(obj, field),
     }
 }
 
@@ -779,6 +827,82 @@ mod tests {
         assert!(
             regions.is_empty(),
             "non-matching filters should yield no regions"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hex-tag field resolution regression (pixel masking on US images)
+    // -----------------------------------------------------------------------
+
+    /// Predicates referencing tags by bare hex ID (e.g. `00081090`) must
+    /// resolve to the correct DICOM element. Before this fix,
+    /// `get_field_string` only did keyword lookup, silently returning None
+    /// for any hex-tag field — causing graylist labels to never match.
+    #[test]
+    fn hex_tag_field_resolves_in_contains() {
+        let mut obj = create_test_obj();
+        // Tag (0008,1090) = ManufacturerModelName
+        put_str(
+            &mut obj,
+            dicom_core::Tag(0x0008, 0x1090),
+            VR::LO,
+            "LOGIQE9",
+        );
+
+        let pred = Predicate::Contains {
+            field: "00081090".into(),
+            value: "LOGIQE9".into(),
+        };
+        assert!(
+            evaluate_predicate(&pred, &obj),
+            "bare hex tag 00081090 should resolve ManufacturerModelName"
+        );
+    }
+
+    #[test]
+    fn hex_tag_field_resolves_in_equals() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::ROWS, VR::US, "720");
+
+        let pred = Predicate::Equals {
+            field: "Rows".into(),
+            value: "720".into(),
+        };
+        assert!(evaluate_predicate(&pred, &obj), "keyword should still work");
+
+        // Now try via hex tag: Rows = (0028,0010) = 00280010
+        put_str(
+            &mut obj,
+            dicom_core::Tag(0x0028, 0x0010),
+            VR::US,
+            "720",
+        );
+        let pred_hex = Predicate::Equals {
+            field: "00280010".into(),
+            value: "720".into(),
+        };
+        assert!(
+            evaluate_predicate(&pred_hex, &obj),
+            "bare hex 00280010 should resolve to Rows"
+        );
+    }
+
+    #[test]
+    fn keyword_lookup_still_preferred_over_hex() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::MANUFACTURER, VR::LO, "GE Healthcare");
+
+        assert!(
+            get_field_string(&obj, "Manufacturer").is_some(),
+            "keyword lookup should work"
+        );
+        assert!(
+            get_field_string(&obj, "00080070").is_some(),
+            "hex tag should also work"
+        );
+        assert_eq!(
+            get_field_string(&obj, "Manufacturer"),
+            get_field_string(&obj, "00080070"),
         );
     }
 }
