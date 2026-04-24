@@ -317,10 +317,7 @@ impl Parser {
         let mut coordinates = Vec::new();
         let mut is_first = true;
 
-        loop {
-            let Some(line) = self.current_line() else {
-                break;
-            };
+        while let Some(line) = self.current_line() {
             if line.is_empty() {
                 self.advance();
                 continue;
