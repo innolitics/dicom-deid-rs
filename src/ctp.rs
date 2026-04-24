@@ -178,9 +178,7 @@ fn parse_anonymizer_xml(xml_text: &str) -> Result<ParsedAnonymizer, DeidError> {
                         let rule_type = attr_value(e, "t").unwrap_or_default();
                         match rule_type.as_str() {
                             "privategroups" => remove_private_tags = enabled == "T",
-                            "unspecifiedelements" => {
-                                remove_unspecified_elements = enabled == "T"
-                            }
+                            "unspecifiedelements" => remove_unspecified_elements = enabled == "T",
                             "curves" if enabled == "T" => {
                                 elements.push(CtpElement {
                                     tag: "(5000-501e,*)".into(),
@@ -201,10 +199,7 @@ fn parse_anonymizer_xml(xml_text: &str) -> Result<ParsedAnonymizer, DeidError> {
             }
             Ok(Event::Eof) => break,
             Err(e) => {
-                return Err(DeidError::RecipeParse(format!(
-                    "XML parse error: {}",
-                    e
-                )));
+                return Err(DeidError::RecipeParse(format!("XML parse error: {}", e)));
             }
             _ => {}
         }
@@ -294,7 +289,10 @@ fn translate_action(action_text: &str, tag: &str) -> Option<String> {
     }
     if action.starts_with("@require(") {
         let args = extract_function_args(action)?;
-        let parts: Vec<&str> = args.splitn(2, ',').map(|s| s.trim().trim_matches('"')).collect();
+        let parts: Vec<&str> = args
+            .splitn(2, ',')
+            .map(|s| s.trim().trim_matches('"'))
+            .collect();
         return match parts.len() {
             1 => Some(format!("ADD {} func:contents({})", tag, parts[0])),
             _ => Some(format!("ADD {} func:value({},{})", tag, parts[0], parts[1])),
@@ -503,10 +501,7 @@ fn translate_if_action(action_text: &str, tag: &str) -> Option<String> {
         "contains" => {
             let value = parts.get(2).unwrap_or(&"").trim_matches('"');
             if true_branch == "@quarantine()" {
-                return Some(format!(
-                    "REMOVE_IF Contains({},{}) {}",
-                    element, value, tag
-                ));
+                return Some(format!("REMOVE_IF Contains({},{}) {}", element, value, tag));
             }
             if true_branch == "@keep()" && false_branch == "@keep()" {
                 return Some(format!("KEEP {}", tag));
@@ -515,10 +510,7 @@ fn translate_if_action(action_text: &str, tag: &str) -> Option<String> {
         "equals" => {
             let value = parts.get(2).unwrap_or(&"").trim_matches('"');
             if true_branch == "@quarantine()" {
-                return Some(format!(
-                    "REMOVE_IF Equals({},{}) {}",
-                    element, value, tag
-                ));
+                return Some(format!("REMOVE_IF Equals({},{}) {}", element, value, tag));
             }
         }
         "matches" => {
@@ -630,8 +622,8 @@ struct PixelBlock {
 }
 
 fn parse_pixel_blocks(script: &str) -> Vec<PixelBlock> {
-    let coord_re = Regex::new(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
-        .unwrap();
+    let coord_re =
+        Regex::new(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)").unwrap();
     let pred_re = Regex::new(
         "^(!?)(\\[[\\d\\w,]+\\]|\\w+)\\.(containsIgnoreCase|equals|equalsIgnoreCase|startsWith|startsWithIgnoreCase)\\(\"([^\"]*)\"\\)$",
     )
@@ -723,11 +715,7 @@ fn parse_pixel_conditions(text: &str, pred_re: &Regex) -> Vec<(String, String)> 
     let parts = split_pixel_conditions(text);
     let mut result = Vec::new();
     for (i, (op, raw)) in parts.iter().enumerate() {
-        let op_str = if i == 0 {
-            "first"
-        } else {
-            op.as_str()
-        };
+        let op_str = if i == 0 { "first" } else { op.as_str() };
         if let Some(predicate) = translate_pixel_predicate(raw.trim(), pred_re) {
             result.push((op_str.to_string(), predicate));
         }
@@ -900,10 +888,7 @@ fn translate_filter_script(filter_text: &str) -> Vec<String> {
         // expression contained only unsupported predicate kinds (e.g.
         // `.exists()` or `.isBlank()`).  Skip rather than emit an empty
         // LABEL, which the recipe parser rejects.
-        let preds: Vec<String> = conjunct
-            .iter()
-            .filter_map(emit_predicate)
-            .collect();
+        let preds: Vec<String> = conjunct.iter().filter_map(emit_predicate).collect();
         if preds.is_empty() {
             continue;
         }
@@ -1041,10 +1026,7 @@ fn parse_filter(text: &str) -> Result<FilterExpr, String> {
     let mut pos = 0;
     let expr = parse_or(&tokens, &mut pos)?;
     if pos != tokens.len() {
-        return Err(format!(
-            "unexpected trailing tokens after position {}",
-            pos
-        ));
+        return Err(format!("unexpected trailing tokens after position {}", pos));
     }
     Ok(expr)
 }
@@ -1104,7 +1086,10 @@ fn parse_atom(tokens: &[FilterToken], pos: &mut usize) -> Result<FilterExpr, Str
             *pos += 1;
             Ok(FilterExpr::Pred(p.clone()))
         }
-        other => Err(format!("expected predicate or '(' at token {}, got {:?}", pos, other)),
+        other => Err(format!(
+            "expected predicate or '(' at token {}, got {:?}",
+            pos, other
+        )),
     }
 }
 
@@ -1205,10 +1190,7 @@ fn tokenize_filter(text: &str) -> Result<Vec<FilterToken>, String> {
                     }));
                     i += full_match.len();
                 } else {
-                    return Err(format!(
-                        "unexpected character {:?} at position {}",
-                        ch, i
-                    ));
+                    return Err(format!("unexpected character {:?} at position {}", ch, i));
                 }
             }
         }
@@ -1260,14 +1242,18 @@ mod tests {
         assert!(result.remove_private_tags);
         assert!(!result.remove_unspecified_elements);
         // Curves and overlays become element removal actions
-        assert!(result
-            .elements
-            .iter()
-            .any(|e| e.tag == "(5000-501e,*)" && e.action == "@remove()"));
-        assert!(result
-            .elements
-            .iter()
-            .any(|e| e.tag == "(6000-601e,*)" && e.action == "@remove()"));
+        assert!(
+            result
+                .elements
+                .iter()
+                .any(|e| e.tag == "(5000-501e,*)" && e.action == "@remove()")
+        );
+        assert!(
+            result
+                .elements
+                .iter()
+                .any(|e| e.tag == "(6000-601e,*)" && e.action == "@remove()")
+        );
     }
 
     #[test]
@@ -1280,9 +1266,11 @@ mod tests {
         let result = parse_anonymizer_xml(xml).unwrap();
         assert_eq!(result.keep_groups.len(), 2);
         assert!(result.keep_groups.contains(&"0018".to_string()));
-        assert!(result
-            .keep_groups
-            .contains(&"safeprivateelements".to_string()));
+        assert!(
+            result
+                .keep_groups
+                .contains(&"safeprivateelements".to_string())
+        );
     }
 
     // --- Action translation tests ---
@@ -1430,10 +1418,7 @@ mod tests {
                 "@append(){CTP: @param(@PROFILENAME): @date():@time()}",
                 "(0012,0063)"
             ),
-            Some(
-                "APPEND (0012,0063) CTP: var:PROFILENAME: func:date:func:time"
-                    .into()
-            )
+            Some("APPEND (0012,0063) CTP: var:PROFILENAME: func:date:func:time".into())
         );
     }
 
@@ -1562,15 +1547,21 @@ mod tests {
         let result = translate_ctp_scripts(Some(xml), None, None).unwrap();
         assert!(result.recipe_text.contains("FORMAT dicom"));
         assert!(result.recipe_text.contains("KEEP (0008,0005)"));
-        assert!(result
-            .recipe_text
-            .contains("REPLACE_ONLY (0008,0018) func:hashuid"));
-        assert!(result
-            .recipe_text
-            .contains("JITTER (0008,0020) var:DATEINC"));
-        assert!(result
-            .recipe_text
-            .contains("REPLACE_ONLY (0010,0010) func:hash"));
+        assert!(
+            result
+                .recipe_text
+                .contains("REPLACE_ONLY (0008,0018) func:hashuid")
+        );
+        assert!(
+            result
+                .recipe_text
+                .contains("JITTER (0008,0020) var:DATEINC")
+        );
+        assert!(
+            result
+                .recipe_text
+                .contains("REPLACE_ONLY (0010,0010) func:hash")
+        );
         // Disabled element should not appear
         assert!(!result.recipe_text.contains("0010,0020"));
         assert_eq!(result.variables["DATEINC"], "-100");

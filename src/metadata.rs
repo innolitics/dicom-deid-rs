@@ -205,7 +205,10 @@ pub fn apply_header_actions(
                 }
                 // Skip non-Process SQ-targeted Add/Replace to avoid infinite
                 // recursion (e.g. writing a literal into an SQ field).
-                if matches!(a.action_type, ActionType::Add | ActionType::Replace | ActionType::ReplaceOnly) {
+                if matches!(
+                    a.action_type,
+                    ActionType::Add | ActionType::Replace | ActionType::ReplaceOnly
+                ) {
                     let tags = resolve_tags(&a.tag, obj).unwrap_or_default();
                     if tags.iter().any(|t| lookup_vr(obj, *t) == VR::SQ) {
                         return None;
@@ -376,10 +379,12 @@ fn evaluate_condition(condition: &ActionCondition, obj: &InMemDicomObject) -> bo
         ActionCondition::IsNotBlank { element } => !is_blank(element),
         ActionCondition::Exists { element } => element_exists(element),
         ActionCondition::NotExists { element } => !element_exists(element),
-        ActionCondition::Contains { element, value } => get_value(element)
-            .is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase())),
-        ActionCondition::NotContains { element, value } => !get_value(element)
-            .is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase())),
+        ActionCondition::Contains { element, value } => {
+            get_value(element).is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase()))
+        }
+        ActionCondition::NotContains { element, value } => {
+            !get_value(element).is_some_and(|v| v.to_lowercase().contains(&value.to_lowercase()))
+        }
         ActionCondition::Equals { element, value } => {
             get_value(element).is_some_and(|v| v.eq_ignore_ascii_case(value))
         }
@@ -394,10 +399,16 @@ fn evaluate_condition(condition: &ActionCondition, obj: &InMemDicomObject) -> bo
         }
         ActionCondition::GreaterThan { element, value } => {
             let parse_numeric = |s: &str| -> Option<i64> {
-                let digits: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '-').collect();
+                let digits: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
                 digits.parse().ok()
             };
-            match (get_value(element).and_then(|v| parse_numeric(&v)), parse_numeric(value)) {
+            match (
+                get_value(element).and_then(|v| parse_numeric(&v)),
+                parse_numeric(value),
+            ) {
                 (Some(a), Some(b)) => a > b,
                 _ => false,
             }

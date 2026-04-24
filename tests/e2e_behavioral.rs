@@ -207,7 +207,13 @@ fn pipeline_blacklist_excludes_file() {
     );
     put_str(&mut sr_file, tags::MODALITY, VR::CS, "SR");
     put_str(&mut sr_file, tags::PATIENT_NAME, VR::PN, "Jane^Doe");
-    put_path_tags(&mut sr_file, "PID002", "20250101", "1", "1.2.3.4.5.6.7.8.10");
+    put_path_tags(
+        &mut sr_file,
+        "PID002",
+        "20250101",
+        "1",
+        "1.2.3.4.5.6.7.8.10",
+    );
     sr_file
         .write_to_file(input_dir.join("sr.dcm"))
         .expect("write SR file");
@@ -337,15 +343,24 @@ fn pipeline_multiple_files_nested_dirs() {
     let study_dir = output_dir.join("DATE-20250101--CT--PID-PID001");
     assert!(study_dir.exists(), "study directory should exist");
     assert!(
-        study_dir.join("SER-00001").join("1.2.3.4.5.6.7.8.1.dcm").exists(),
+        study_dir
+            .join("SER-00001")
+            .join("1.2.3.4.5.6.7.8.1.dcm")
+            .exists(),
         "series 1 file should exist"
     );
     assert!(
-        study_dir.join("SER-00002").join("1.2.3.4.5.6.7.8.2.dcm").exists(),
+        study_dir
+            .join("SER-00002")
+            .join("1.2.3.4.5.6.7.8.2.dcm")
+            .exists(),
         "series 2 file should exist"
     );
     assert!(
-        study_dir.join("SER-00003").join("1.2.3.4.5.6.7.8.3.dcm").exists(),
+        study_dir
+            .join("SER-00003")
+            .join("1.2.3.4.5.6.7.8.3.dcm")
+            .exists(),
         "series 3 file should exist"
     );
 
@@ -380,7 +395,13 @@ fn pipeline_graylist_pixel_masking() {
     put_str(&mut file_obj, tags::MANUFACTURER, VR::LO, "GE MEDICAL");
     put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
     put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
-    put_path_tags(&mut file_obj, "PID001", "20250101", "1", "1.2.3.4.5.6.7.8.9");
+    put_path_tags(
+        &mut file_obj,
+        "PID001",
+        "20250101",
+        "1",
+        "1.2.3.4.5.6.7.8.9",
+    );
 
     // Set pixel data attributes: 4x4 monochrome image, 8-bit
     file_obj.put(DataElement::new(

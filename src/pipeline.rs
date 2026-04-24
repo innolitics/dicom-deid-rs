@@ -159,6 +159,18 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     output_dir.join(study_dir).join(ser_part).join(file_name)
 }
 
+/// Read the `DATEINC` recipe variable as a signed day offset.
+///
+/// Used to parameterize `jitter_timestamp_array` so it shifts dates by the
+/// same amount as `JITTER … var:DATEINC`. Missing or unparseable values fall
+/// back to 0 (no shift), matching the JITTER action's no-op-on-blank rule.
+fn dateinc_days(variables: &HashMap<String, String>) -> i64 {
+    variables
+        .get("DATEINC")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 impl DeidPipeline {
     /// Create a new pipeline, parsing the recipe from the configured path.
     ///
@@ -169,6 +181,10 @@ impl DeidPipeline {
         let recipe_text = fs::read_to_string(&config.recipe_path)?;
         let recipe = Recipe::parse(&recipe_text)?;
         let mut merged = functions::default_functions();
+        merged.insert(
+            "jitter_timestamp_array".into(),
+            functions::make_jitter_timestamp_array(dateinc_days(&config.variables)),
+        );
         for (name, func) in config.functions.drain() {
             merged.insert(name, func);
         }
@@ -185,6 +201,10 @@ impl DeidPipeline {
     pub fn from_recipe_text(recipe_text: &str, mut config: DeidConfig) -> Result<Self, DeidError> {
         let recipe = Recipe::parse(recipe_text)?;
         let mut merged = functions::default_functions();
+        merged.insert(
+            "jitter_timestamp_array".into(),
+            functions::make_jitter_timestamp_array(dateinc_days(&config.variables)),
+        );
         for (name, func) in config.functions.drain() {
             merged.insert(name, func);
         }
@@ -215,11 +235,9 @@ impl DeidPipeline {
         let pb = if is_tty {
             let pb = ProgressBar::new(total as u64);
             pb.set_style(
-                ProgressStyle::with_template(
-                    "[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})",
-                )
-                .expect("valid progress bar template")
-                .progress_chars("=> "),
+                ProgressStyle::with_template("[{elapsed_precise}] [{bar:40}] {pos}/{len} ({eta})")
+                    .expect("valid progress bar template")
+                    .progress_chars("=> "),
             );
             Some(pb)
         } else {
@@ -888,7 +906,11 @@ mod tests {
             .join("DATE-20250101--CT--PID-PID001")
             .join("SER-00001")
             .join("1.2.3.4.5.6.7.8.9.dcm");
-        assert!(output_file.exists(), "output file should exist at CTP-style path: {}", output_file.display());
+        assert!(
+            output_file.exists(),
+            "output file should exist at CTP-style path: {}",
+            output_file.display()
+        );
 
         // Verify the patient name was replaced
         let result_obj = open_file(&output_file).expect("should open output");

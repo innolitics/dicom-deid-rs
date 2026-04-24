@@ -1,5 +1,6 @@
 use crate::error::DeidError;
 use crate::metadata::DeidFunction;
+use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -13,8 +14,15 @@ use std::sync::Arc;
 /// unsigned integer. The result is truncated to 64 characters (the
 /// DICOM UID maximum length).
 ///
-/// This is deterministic: the same input always produces the same UID.
+/// Empty/whitespace input is preserved as-is — hashing "" would otherwise
+/// produce the same UID for every empty tag, which collapses distinct
+/// elements onto a single identifier.
+///
+/// This is deterministic: the same non-empty input always produces the same UID.
 fn hashuid(input: &str) -> Result<String, DeidError> {
+    if input.trim().is_empty() {
+        return Ok(String::new());
+    }
     let hash = Sha256::digest(input.as_bytes());
     // Take the first 16 bytes (128 bits) as a u128
     let bytes: [u8; 16] = hash[..16].try_into().expect("slice is 16 bytes");
@@ -258,6 +266,58 @@ pub fn create_lookup_function(
     Ok(functions)
 }
 
+/// Shift a single DICOM date (DA) or datetime (DT) value by `days`.
+///
+/// The DICOM date portion is always the first 8 chars (YYYYMMDD). Anything
+/// after is a time/zone suffix (DT: `HHMMSS[.FFFFFF][+/-HHMM]`) which is
+/// preserved verbatim. Empty values are returned as empty.
+fn jitter_single_timestamp(value: &str, days: i64) -> Result<String, DeidError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() < 8 {
+        return Err(DeidError::Dicom(format!(
+            "jitter_timestamp_array: value too short to contain a date: '{}'",
+            trimmed
+        )));
+    }
+    let (date_part, suffix) = trimmed.split_at(8);
+    let date = NaiveDate::parse_from_str(date_part, "%Y%m%d").map_err(|e| {
+        DeidError::Dicom(format!(
+            "jitter_timestamp_array: invalid date '{}': {}",
+            date_part, e
+        ))
+    })?;
+    let shifted = date + chrono::Duration::days(days);
+    Ok(format!("{}{}", shifted.format("%Y%m%d"), suffix))
+}
+
+/// Build a `jitter_timestamp_array` function that shifts every value in a
+/// backslash-separated DA/DT multi-value field by `days`.
+///
+/// Mirrors the behaviour of pydicom's deid `jitter_timestamp_array` helper:
+/// the stored field may contain multiple DA/DT values (VM 1-n) separated by
+/// `\`, and each is shifted independently. Empty values remain empty so that
+/// absent data is not fabricated.
+///
+/// The `days` offset is captured at construction time. Callers should read
+/// it from the same variable that `JITTER … var:DATEINC` uses (typically
+/// the recipe's `DATEINC` variable) so the two date-shift mechanisms stay
+/// in sync.
+pub fn make_jitter_timestamp_array(days: i64) -> DeidFunction {
+    Box::new(move |input: &str| -> Result<String, DeidError> {
+        if input.trim().is_empty() {
+            return Ok(String::new());
+        }
+        let shifted: Result<Vec<String>, DeidError> = input
+            .split('\\')
+            .map(|part| jitter_single_timestamp(part, days))
+            .collect();
+        Ok(shifted?.join("\\"))
+    })
+}
+
 /// Return the default built-in functions available in recipes.
 pub fn default_functions() -> HashMap<String, DeidFunction> {
     let mut map: HashMap<String, DeidFunction> = HashMap::new();
@@ -328,10 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn hashuid_empty_input() {
-        let uid = hashuid("").unwrap();
-        assert!(uid.starts_with("2.25."));
-        assert!(uid.len() <= 64);
+    fn hashuid_empty_input_preserved() {
+        assert_eq!(hashuid("").unwrap(), "");
+        assert_eq!(hashuid("   ").unwrap(), "");
     }
 
     #[test]
@@ -563,6 +622,67 @@ mod tests {
     #[test]
     fn modifydate_passthrough() {
         assert_eq!(modifydate("20210101").unwrap(), "20210101");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_single_date() {
+        let f = make_jitter_timestamp_array(5);
+        assert_eq!(f("20200115").unwrap(), "20200120");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_multi_value() {
+        let f = make_jitter_timestamp_array(10);
+        // DICOM VM 1-n fields separate values with '\\'
+        assert_eq!(
+            f("20200101\\20210101\\20220101").unwrap(),
+            "20200111\\20210111\\20220111"
+        );
+    }
+
+    #[test]
+    fn jitter_timestamp_array_preserves_time_suffix() {
+        let f = make_jitter_timestamp_array(3);
+        // DT value: date + time + fractional + zone
+        assert_eq!(
+            f("20200115120000.000000+0500").unwrap(),
+            "20200118120000.000000+0500"
+        );
+    }
+
+    #[test]
+    fn jitter_timestamp_array_empty_input_empty_output() {
+        let f = make_jitter_timestamp_array(5);
+        assert_eq!(f("").unwrap(), "");
+        assert_eq!(f("   ").unwrap(), "");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_preserves_empty_elements() {
+        let f = make_jitter_timestamp_array(5);
+        // A multi-value field with a blank slot keeps the blank slot blank
+        assert_eq!(f("20200101\\").unwrap(), "20200106\\");
+        assert_eq!(f("\\20200101").unwrap(), "\\20200106");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_negative_days() {
+        let f = make_jitter_timestamp_array(-5);
+        assert_eq!(f("20200115").unwrap(), "20200110");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_zero_days_is_identity() {
+        let f = make_jitter_timestamp_array(0);
+        assert_eq!(f("20200115").unwrap(), "20200115");
+        assert_eq!(f("20200101\\20210101").unwrap(), "20200101\\20210101");
+    }
+
+    #[test]
+    fn jitter_timestamp_array_invalid_date_errors() {
+        let f = make_jitter_timestamp_array(5);
+        assert!(f("notadate").is_err());
+        assert!(f("2020").is_err());
     }
 
     #[test]

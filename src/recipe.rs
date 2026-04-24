@@ -629,7 +629,10 @@ fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
 /// Examples:
 ///   `REMOVE_IF IsBlank(this) (0040,a075)`
 ///   `REPLACE_IF IsNotBlank(this) (0040,a075) Removed by CTP`
-fn parse_conditional_action(action_str: &str, rest: &str) -> Result<Option<HeaderAction>, DeidError> {
+fn parse_conditional_action(
+    action_str: &str,
+    rest: &str,
+) -> Result<Option<HeaderAction>, DeidError> {
     let action_type = match action_str {
         "ADD" => ActionType::Add,
         "REPLACE" => ActionType::Replace,
@@ -675,12 +678,12 @@ fn parse_conditional_action(action_str: &str, rest: &str) -> Result<Option<Heade
 
 /// Parse a condition expression like `IsBlank(this)` or `Contains(ImageType,"SCREEN SAVE")`.
 fn parse_action_condition(s: &str) -> Result<ActionCondition, DeidError> {
-    let paren_start = s.find('(').ok_or_else(|| {
-        DeidError::RecipeParse(format!("expected '(' in condition: {}", s))
-    })?;
-    let paren_end = s.rfind(')').ok_or_else(|| {
-        DeidError::RecipeParse(format!("expected ')' in condition: {}", s))
-    })?;
+    let paren_start = s
+        .find('(')
+        .ok_or_else(|| DeidError::RecipeParse(format!("expected '(' in condition: {}", s)))?;
+    let paren_end = s
+        .rfind(')')
+        .ok_or_else(|| DeidError::RecipeParse(format!("expected ')' in condition: {}", s)))?;
     let name = s[..paren_start].trim();
     let args_str = &s[paren_start + 1..paren_end];
 

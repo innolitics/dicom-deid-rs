@@ -12,7 +12,10 @@ fn print_usage(program: &str) {
         "Usage: {} <input_dir> <output_dir> <recipe_file> [OPTIONS]",
         program
     );
-    eprintln!("       {} translate-ctp <anonymizer.xml> [OPTIONS]", program);
+    eprintln!(
+        "       {} translate-ctp <anonymizer.xml> [OPTIONS]",
+        program
+    );
     eprintln!();
     eprintln!("Pipeline options:");
     eprintln!("  --var NAME VALUE              Define a recipe variable (can be repeated)");
@@ -149,7 +152,10 @@ fn main() {
 
 fn run_translate_ctp(args: &[String]) {
     if args.len() < 3 {
-        eprintln!("Usage: {} translate-ctp <anonymizer.xml> [--pixel PATH] [--filter PATH] [-o PATH]", args[0]);
+        eprintln!(
+            "Usage: {} translate-ctp <anonymizer.xml> [--pixel PATH] [--filter PATH] [-o PATH]",
+            args[0]
+        );
         process::exit(1);
     }
 
