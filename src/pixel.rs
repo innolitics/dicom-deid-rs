@@ -243,8 +243,8 @@ mod tests {
     use crate::recipe::*;
     use crate::test_helpers::*;
     use dicom_core::DataElement;
-    use dicom_core::value::{PrimitiveValue, Value};
     use dicom_core::VR;
+    use dicom_core::value::{PrimitiveValue, Value};
     use dicom_dictionary_std::tags;
 
     /// Helper to create a minimal DICOM object with pixel data.

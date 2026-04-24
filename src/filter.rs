@@ -20,12 +20,13 @@ fn field_as_tag(field: &str) -> Option<Tag> {
     if field.starts_with('(') {
         return parse_parenthesized_tag(field).ok();
     }
-    if let Some((g, e)) = field.split_once(',') {
-        if let (Ok(group), Ok(element)) =
-            (u16::from_str_radix(g.trim(), 16), u16::from_str_radix(e.trim(), 16))
-        {
-            return Some(Tag(group, element));
-        }
+    if let Some((g, e)) = field.split_once(',')
+        && let (Ok(group), Ok(element)) = (
+            u16::from_str_radix(g.trim(), 16),
+            u16::from_str_radix(e.trim(), 16),
+        )
+    {
+        return Some(Tag(group, element));
     }
     parse_bare_hex_tag(field).ok()
 }
@@ -51,8 +52,7 @@ fn resolve_element<'a>(
 
 /// Resolve a DICOM field value as a string, returning None if the field is missing.
 pub fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
-    resolve_element(obj, field)
-        .and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
+    resolve_element(obj, field).and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
 }
 
 /// Return `true` when the field resolves to an element in the object.
@@ -842,12 +842,7 @@ mod tests {
     fn hex_tag_field_resolves_in_contains() {
         let mut obj = create_test_obj();
         // Tag (0008,1090) = ManufacturerModelName
-        put_str(
-            &mut obj,
-            dicom_core::Tag(0x0008, 0x1090),
-            VR::LO,
-            "LOGIQE9",
-        );
+        put_str(&mut obj, dicom_core::Tag(0x0008, 0x1090), VR::LO, "LOGIQE9");
 
         let pred = Predicate::Contains {
             field: "00081090".into(),
@@ -871,12 +866,7 @@ mod tests {
         assert!(evaluate_predicate(&pred, &obj), "keyword should still work");
 
         // Now try via hex tag: Rows = (0028,0010) = 00280010
-        put_str(
-            &mut obj,
-            dicom_core::Tag(0x0028, 0x0010),
-            VR::US,
-            "720",
-        );
+        put_str(&mut obj, dicom_core::Tag(0x0028, 0x0010), VR::US, "720");
         let pred_hex = Predicate::Equals {
             field: "00280010".into(),
             value: "720".into(),

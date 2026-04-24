@@ -443,12 +443,10 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::Missing { field } => !crate::filter::field_present(obj, field),
-        Predicate::Empty { field } => {
-            match crate::filter::get_field_string(obj, field) {
-                Some(s) => s.is_empty(),
-                None => false,
-            }
-        }
+        Predicate::Empty { field } => match crate::filter::get_field_string(obj, field) {
+            Some(s) => s.is_empty(),
+            None => false,
+        },
         Predicate::Present { field } => crate::filter::field_present(obj, field),
     }
 }
