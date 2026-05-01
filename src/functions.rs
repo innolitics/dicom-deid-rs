@@ -283,14 +283,13 @@ fn jitter_single_timestamp(value: &str, days: i64) -> Result<String, DeidError> 
         )));
     }
     let (date_part, suffix) = trimmed.split_at(8);
-    let date = NaiveDate::parse_from_str(date_part, "%Y%m%d").map_err(|e| {
-        DeidError::Dicom(format!(
-            "jitter_timestamp_array: invalid date '{}': {}",
-            date_part, e
-        ))
-    })?;
-    let shifted = date + chrono::Duration::days(days);
-    Ok(format!("{}{}", shifted.format("%Y%m%d"), suffix))
+    if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+        let shifted = date + chrono::Duration::days(days);
+        Ok(format!("{}{}", shifted.format("%Y%m%d"), suffix))
+    } else {
+        // If the date part is invalid, return an empty value
+        Ok(String::new())
+    }
 }
 
 /// Build a `jitter_timestamp_array` function that shifts every value in a
