@@ -52,12 +52,20 @@ fn run_pipeline_on_fixture(
         recipe_path: "resources/complete-recipe.txt".into(),
         variables,
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
     let report = pipeline.run().expect("should run pipeline");
 
-    let output_path = output_dir.join(fixture_name);
+    // Find the single output .dcm file (CTP-style path)
+    let output_path = DeidPipeline::find_dicom_files(&output_dir)
+        .expect("should find output files")
+        .into_iter()
+        .next()
+        .expect("should have at least one output file");
     // Leak the TempDir so it's not cleaned up before the caller reads the output
     std::mem::forget(tmp);
     (output_path, report)

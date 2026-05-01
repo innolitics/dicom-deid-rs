@@ -44,6 +44,20 @@ fn create_test_file_obj() -> FileDicomObject<InMemDicomObject> {
     )
 }
 
+/// Set the tags required for CTP-style output path generation.
+fn put_path_tags(
+    obj: &mut FileDicomObject<InMemDicomObject>,
+    patient_id: &str,
+    study_date: &str,
+    series_number: &str,
+    sop_uid: &str,
+) {
+    put_str(obj, tags::PATIENT_ID, VR::LO, patient_id);
+    put_str(obj, tags::STUDY_DATE, VR::DA, study_date);
+    put_str(obj, tags::SERIES_NUMBER, VR::IS, series_number);
+    put_str(obj, tags::SOP_INSTANCE_UID, VR::UI, sop_uid);
+}
+
 fn empty_vars() -> HashMap<String, String> {
     HashMap::new()
 }
@@ -176,6 +190,7 @@ fn pipeline_blacklist_excludes_file() {
     let mut ct_file = create_test_file_obj();
     put_str(&mut ct_file, tags::MODALITY, VR::CS, "CT");
     put_str(&mut ct_file, tags::PATIENT_NAME, VR::PN, "John^Doe");
+    put_path_tags(&mut ct_file, "PID001", "20250101", "1", "1.2.3.4.5.6.7.8.9");
     ct_file
         .write_to_file(input_dir.join("ct.dcm"))
         .expect("write CT file");
@@ -192,6 +207,13 @@ fn pipeline_blacklist_excludes_file() {
     );
     put_str(&mut sr_file, tags::MODALITY, VR::CS, "SR");
     put_str(&mut sr_file, tags::PATIENT_NAME, VR::PN, "Jane^Doe");
+    put_path_tags(
+        &mut sr_file,
+        "PID002",
+        "20250101",
+        "1",
+        "1.2.3.4.5.6.7.8.10",
+    );
     sr_file
         .write_to_file(input_dir.join("sr.dcm"))
         .expect("write SR file");
@@ -221,6 +243,9 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -229,13 +254,18 @@ REPLACE PatientName ANON
     assert_eq!(report.files_processed, 1, "only CT should be processed");
     assert_eq!(report.files_blacklisted, 1, "SR should be blacklisted");
 
-    // CT file should exist in output
-    let ct_output = output_dir.join("ct.dcm");
+    // CT file should exist in output at CTP-style path
+    let ct_output = output_dir
+        .join("DATE-20250101--CT--PID-PID001")
+        .join("SER-00001")
+        .join("1.2.3.4.5.6.7.8.9.dcm");
     assert!(ct_output.exists(), "CT output file should exist");
 
-    // SR file should NOT exist in output
-    let sr_output = output_dir.join("sr.dcm");
-    assert!(!sr_output.exists(), "SR output file should not exist");
+    // SR file should NOT exist in output (blacklisted)
+    assert!(
+        !output_dir.join("DATE-20250101--SR--PID-PID002").exists(),
+        "SR output directory should not exist"
+    );
 
     // Verify CT was de-identified
     let result = open_file(&ct_output).expect("should open CT output");
@@ -257,11 +287,11 @@ fn pipeline_multiple_files_nested_dirs() {
     let sub2 = input_dir.join("sub1").join("sub2");
     fs::create_dir_all(&sub2).expect("create nested dirs");
 
-    // Create 3 DICOM files in different locations
-    for (dir, name, uid_suffix) in [
-        (input_dir.as_path(), "root.dcm", "1"),
-        (sub1.as_path(), "level1.dcm", "2"),
-        (sub2.as_path(), "level2.dcm", "3"),
+    // Create 3 DICOM files in different locations (simulating storescp output)
+    for (dir, name, uid_suffix, series_num) in [
+        (input_dir.as_path(), "root.dcm", "1", "1"),
+        (sub1.as_path(), "level1.dcm", "2", "2"),
+        (sub2.as_path(), "level2.dcm", "3", "3"),
     ] {
         let mut file_obj = FileDicomObject::new_empty_with_meta(
             FileMetaTableBuilder::new()
@@ -274,6 +304,13 @@ fn pipeline_multiple_files_nested_dirs() {
         );
         put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
         put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
+        put_path_tags(
+            &mut file_obj,
+            "PID001",
+            "20250101",
+            series_num,
+            &format!("1.2.3.4.5.6.7.8.{}", uid_suffix),
+        );
         file_obj
             .write_to_file(dir.join(name))
             .expect("write DICOM file");
@@ -292,6 +329,9 @@ fn pipeline_multiple_files_nested_dirs() {
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -299,30 +339,36 @@ fn pipeline_multiple_files_nested_dirs() {
 
     assert_eq!(report.files_processed, 3, "all 3 files should be processed");
 
-    // Verify directory structure is preserved (r-1-4)
+    // Verify output uses CTP-style directory structure
+    let study_dir = output_dir.join("DATE-20250101--CT--PID-PID001");
+    assert!(study_dir.exists(), "study directory should exist");
     assert!(
-        output_dir.join("root.dcm").exists(),
-        "root-level file should exist"
-    );
-    assert!(
-        output_dir.join("sub1").join("level1.dcm").exists(),
-        "sub1-level file should exist"
-    );
-    assert!(
-        output_dir
-            .join("sub1")
-            .join("sub2")
-            .join("level2.dcm")
+        study_dir
+            .join("SER-00001")
+            .join("1.2.3.4.5.6.7.8.1.dcm")
             .exists(),
-        "sub2-level file should exist"
+        "series 1 file should exist"
+    );
+    assert!(
+        study_dir
+            .join("SER-00002")
+            .join("1.2.3.4.5.6.7.8.2.dcm")
+            .exists(),
+        "series 2 file should exist"
+    );
+    assert!(
+        study_dir
+            .join("SER-00003")
+            .join("1.2.3.4.5.6.7.8.3.dcm")
+            .exists(),
+        "series 3 file should exist"
     );
 
     // Verify all files were de-identified
-    for path in [
-        output_dir.join("root.dcm"),
-        output_dir.join("sub1").join("level1.dcm"),
-        output_dir.join("sub1").join("sub2").join("level2.dcm"),
-    ] {
+    for i in 1..=3 {
+        let path = study_dir
+            .join(format!("SER-{:05}", i))
+            .join(format!("1.2.3.4.5.6.7.8.{}.dcm", i));
         let result = open_file(&path).expect("should open output");
         let name = result
             .element_by_name("PatientName")
@@ -349,6 +395,13 @@ fn pipeline_graylist_pixel_masking() {
     put_str(&mut file_obj, tags::MANUFACTURER, VR::LO, "GE MEDICAL");
     put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
     put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+    put_path_tags(
+        &mut file_obj,
+        "PID001",
+        "20250101",
+        "1",
+        "1.2.3.4.5.6.7.8.9",
+    );
 
     // Set pixel data attributes: 4x4 monochrome image, 8-bit
     file_obj.put(DataElement::new(
@@ -430,6 +483,9 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -437,7 +493,10 @@ REPLACE PatientName ANON
 
     assert_eq!(report.files_processed, 1);
 
-    let output_file = output_dir.join("ge_ct.dcm");
+    let output_file = output_dir
+        .join("DATE-20250101--CT--PID-PID001")
+        .join("SER-00001")
+        .join("1.2.3.4.5.6.7.8.9.dcm");
     assert!(output_file.exists(), "output file should exist");
 
     // Read back and check pixel data has masked region
@@ -754,6 +813,9 @@ REPLACE PatientName ANON
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");
@@ -816,6 +878,9 @@ fn pipeline_no_blacklist_no_report_file() {
         recipe_path,
         variables: HashMap::new(),
         functions: HashMap::new(),
+        remove_private_tags: true,
+        remove_unspecified_elements: false,
+        quarantine_dir: None,
     };
 
     let pipeline = DeidPipeline::new(config).expect("should create pipeline");

@@ -10,6 +10,15 @@ pub struct Recipe {
     pub format: String,
     pub header: Vec<HeaderAction>,
     pub filters: Vec<FilterSection>,
+    pub keep_groups: Vec<KeepGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepGroup {
+    /// Keep all elements in the specified DICOM group (e.g. 0x0018).
+    Group(u16),
+    /// Keep private elements listed in the curated safe-private-elements list.
+    SafePrivateElements,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +31,7 @@ pub struct FilterSection {
 pub enum FilterType {
     Graylist,
     Blacklist,
+    Whitelist,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +63,8 @@ pub enum Predicate {
     NotContains { field: String, value: String },
     Equals { field: String, value: String },
     NotEquals { field: String, value: String },
+    StartsWith { field: String, value: String },
+    NotStartsWith { field: String, value: String },
     Missing { field: String },
     Empty { field: String },
     Present { field: String },
@@ -72,23 +84,56 @@ pub struct HeaderAction {
     pub action_type: ActionType,
     pub tag: TagSpecifier,
     pub value: Option<ActionValue>,
+    /// Optional condition that must be met for this action to execute.
+    pub condition: Option<ActionCondition>,
+}
+
+/// A condition that gates execution of a header action.
+///
+/// Parsed from `ACTION_IF <Condition> <tag> [value]` syntax, e.g.
+/// `REMOVE_IF IsBlank(this) (0040,a075)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActionCondition {
+    IsBlank { element: String },
+    IsNotBlank { element: String },
+    Exists { element: String },
+    NotExists { element: String },
+    Contains { element: String, value: String },
+    NotContains { element: String, value: String },
+    Equals { element: String, value: String },
+    NotEquals { element: String, value: String },
+    Matches { element: String, pattern: String },
+    GreaterThan { element: String, value: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionType {
+    /// Create with value if absent, no-op if present. Maps to CTP `@require()`.
     Add,
+    /// Create or overwrite unconditionally. Maps to CTP `@always()`.
     Replace,
+    /// Overwrite if present, skip if absent. Default for CTP `<e>` element rules.
+    ReplaceOnly,
+    /// Delete the element.
     Remove,
+    /// Set value to empty string but keep the element.
     Blank,
+    /// Preserve the element unmodified.
     Keep,
+    /// Shift a date value by N days.
     Jitter,
+    /// Append to a multi-valued element. Maps to CTP `@append()`.
+    Append,
+    /// Mark an SQ element for recursive processing of its item datasets.
+    /// Maps to CTP `@process()`.
+    Process,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionValue {
     Literal(String),
     Variable(String),
-    Function { name: String },
+    Function { name: String, args: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +141,14 @@ pub enum TagSpecifier {
     Keyword(String),
     TagValue(Tag),
     Pattern(String),
+    /// Match all tags whose group is in [group_min, group_max] (inclusive).
+    /// When `element` is `Some`, only that element number matches;
+    /// when `None`, every element in the matching groups matches (wildcard).
+    GroupRange {
+        group_min: u16,
+        group_max: u16,
+        element: Option<u16>,
+    },
     PrivateTag {
         group: u16,
         creator: String,
@@ -108,8 +161,10 @@ pub enum TagSpecifier {
 // ---------------------------------------------------------------------------
 
 const PREDICATE_KEYWORDS: &[&str] = &[
+    "notstartswith",
     "notcontains",
     "notequals",
+    "startswith",
     "contains",
     "equals",
     "missing",
@@ -161,6 +216,7 @@ impl Parser {
         let format = self.expect_format()?;
         let mut header = Vec::new();
         let mut filters = Vec::new();
+        let mut keep_groups = Vec::new();
 
         loop {
             self.skip_empty();
@@ -179,6 +235,9 @@ impl Parser {
                     filter_type,
                     labels,
                 });
+            } else if let Some(rest) = line.strip_prefix("KEEP_GROUP ") {
+                keep_groups.push(parse_keep_group(rest.trim())?);
+                self.advance();
             } else {
                 // Skip unrecognized lines (handles stray /* */ blocks, etc.)
                 self.advance();
@@ -189,6 +248,7 @@ impl Parser {
             format,
             header,
             filters,
+            keep_groups,
         })
     }
 
@@ -257,10 +317,7 @@ impl Parser {
         let mut coordinates = Vec::new();
         let mut is_first = true;
 
-        loop {
-            let Some(line) = self.current_line() else {
-                break;
-            };
+        while let Some(line) = self.current_line() {
             if line.is_empty() {
                 self.advance();
                 continue;
@@ -299,6 +356,7 @@ fn parse_filter_type(s: &str) -> Result<FilterType, DeidError> {
     match s {
         "graylist" => Ok(FilterType::Graylist),
         "blacklist" => Ok(FilterType::Blacklist),
+        "whitelist" => Ok(FilterType::Whitelist),
         _ => Err(DeidError::RecipeParse(format!(
             "unknown filter type: {}",
             s
@@ -468,15 +526,21 @@ fn split_inline_operators(content: &str) -> Vec<(LogicalOp, String)> {
 
 fn parse_predicate(text: &str) -> Result<Predicate, DeidError> {
     // Check longer keywords first to avoid prefix conflicts
-    if let Some(rest) = text.strip_prefix("notcontains ") {
+    if let Some(rest) = text.strip_prefix("notstartswith ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::NotStartsWith { field, value })
+    } else if let Some(rest) = text.strip_prefix("notcontains ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::NotContains { field, value })
-    } else if let Some(rest) = text.strip_prefix("contains ") {
-        let (field, value) = split_field_value(rest.trim())?;
-        Ok(Predicate::Contains { field, value })
     } else if let Some(rest) = text.strip_prefix("notequals ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::NotEquals { field, value })
+    } else if let Some(rest) = text.strip_prefix("startswith ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::StartsWith { field, value })
+    } else if let Some(rest) = text.strip_prefix("contains ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::Contains { field, value })
     } else if let Some(rest) = text.strip_prefix("equals ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::Equals { field, value })
@@ -501,13 +565,21 @@ fn parse_predicate(text: &str) -> Result<Predicate, DeidError> {
 }
 
 fn split_field_value(text: &str) -> Result<(String, String), DeidError> {
-    let (field, value) = text.split_once(' ').ok_or_else(|| {
-        DeidError::RecipeParse(format!("expected field and value in predicate: {}", text))
-    })?;
-    Ok((field.to_string(), value.trim().to_string()))
+    // When the value is absent (no space after the field name), treat it
+    // as an empty string.  This matches CTP's `.equals("")` semantics when
+    // translated — the field is tested against an empty value.
+    match text.split_once(' ') {
+        Some((field, value)) => Ok((field.to_string(), value.trim().to_string())),
+        None => Ok((text.to_string(), String::new())),
+    }
 }
 
 fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
+    // Check for conditional syntax: ACTION_IF <condition> <tag> [value]
+    if let Some((action_str, rest)) = line.split_once("_IF ") {
+        return parse_conditional_action(action_str, rest);
+    }
+
     let mut parts = line.splitn(3, ' ');
     let action_str = match parts.next() {
         Some(s) if !s.is_empty() => s,
@@ -517,10 +589,13 @@ fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
     let action_type = match action_str {
         "ADD" => ActionType::Add,
         "REPLACE" => ActionType::Replace,
+        "REPLACE_ONLY" => ActionType::ReplaceOnly,
         "REMOVE" => ActionType::Remove,
         "BLANK" => ActionType::Blank,
         "KEEP" => ActionType::Keep,
         "JITTER" => ActionType::Jitter,
+        "APPEND" => ActionType::Append,
+        "PROCESS" => ActionType::Process,
         _ => return Ok(None), // Unrecognized line, silently skip
     };
 
@@ -531,7 +606,7 @@ fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
     let tag = parse_tag_specifier(tag_str)?;
 
     let value = match action_type {
-        ActionType::Remove | ActionType::Blank | ActionType::Keep => None,
+        ActionType::Remove | ActionType::Blank | ActionType::Keep | ActionType::Process => None,
         _ => match parts.next() {
             Some(v) if !v.trim().is_empty() => Some(parse_action_value(v.trim())?),
             _ => None,
@@ -542,19 +617,178 @@ fn parse_header_action(line: &str) -> Result<Option<HeaderAction>, DeidError> {
         action_type,
         tag,
         value,
+        condition: None,
     }))
+}
+
+/// Parse a conditional action: `ACTION_IF <Condition(args)> <tag> [value]`
+///
+/// Examples:
+///   `REMOVE_IF IsBlank(this) (0040,a075)`
+///   `REPLACE_IF IsNotBlank(this) (0040,a075) Removed by CTP`
+fn parse_conditional_action(
+    action_str: &str,
+    rest: &str,
+) -> Result<Option<HeaderAction>, DeidError> {
+    let action_type = match action_str {
+        "ADD" => ActionType::Add,
+        "REPLACE" => ActionType::Replace,
+        "REPLACE_ONLY" => ActionType::ReplaceOnly,
+        "REMOVE" => ActionType::Remove,
+        "BLANK" => ActionType::Blank,
+        "KEEP" => ActionType::Keep,
+        "JITTER" => ActionType::Jitter,
+        "APPEND" => ActionType::Append,
+        "QUARANTINE" => ActionType::Remove, // quarantine = remove from processing
+        _ => return Ok(None),
+    };
+
+    // rest is: <Condition(args)> <tag> [value]
+    // Find the closing ')' of the condition
+    let paren_end = rest.find(')').ok_or_else(|| {
+        DeidError::RecipeParse(format!("expected closing ')' in condition: {}", rest))
+    })?;
+
+    let condition_str = &rest[..=paren_end];
+    let after_condition = rest[paren_end + 1..].trim();
+
+    let condition = parse_action_condition(condition_str)?;
+
+    let mut parts = after_condition.splitn(2, ' ');
+    let tag_str = parts
+        .next()
+        .ok_or_else(|| DeidError::RecipeParse("expected tag after condition".into()))?;
+    let tag = parse_tag_specifier(tag_str)?;
+
+    let value = match parts.next() {
+        Some(v) if !v.trim().is_empty() => Some(parse_action_value(v.trim())?),
+        _ => None,
+    };
+
+    Ok(Some(HeaderAction {
+        action_type,
+        tag,
+        value,
+        condition: Some(condition),
+    }))
+}
+
+/// Parse a condition expression like `IsBlank(this)` or `Contains(ImageType,"SCREEN SAVE")`.
+fn parse_action_condition(s: &str) -> Result<ActionCondition, DeidError> {
+    let paren_start = s
+        .find('(')
+        .ok_or_else(|| DeidError::RecipeParse(format!("expected '(' in condition: {}", s)))?;
+    let paren_end = s
+        .rfind(')')
+        .ok_or_else(|| DeidError::RecipeParse(format!("expected ')' in condition: {}", s)))?;
+    let name = s[..paren_start].trim();
+    let args_str = &s[paren_start + 1..paren_end];
+
+    // Split args on comma, respecting quotes
+    let args: Vec<String> = split_condition_args(args_str);
+
+    match name {
+        "IsBlank" => Ok(ActionCondition::IsBlank {
+            element: args.first().cloned().unwrap_or_default(),
+        }),
+        "IsNotBlank" => Ok(ActionCondition::IsNotBlank {
+            element: args.first().cloned().unwrap_or_default(),
+        }),
+        "Exists" => Ok(ActionCondition::Exists {
+            element: args.first().cloned().unwrap_or_default(),
+        }),
+        "NotExists" => Ok(ActionCondition::NotExists {
+            element: args.first().cloned().unwrap_or_default(),
+        }),
+        "Contains" => Ok(ActionCondition::Contains {
+            element: args.first().cloned().unwrap_or_default(),
+            value: args.get(1).cloned().unwrap_or_default(),
+        }),
+        "NotContains" => Ok(ActionCondition::NotContains {
+            element: args.first().cloned().unwrap_or_default(),
+            value: args.get(1).cloned().unwrap_or_default(),
+        }),
+        "Equals" => Ok(ActionCondition::Equals {
+            element: args.first().cloned().unwrap_or_default(),
+            value: args.get(1).cloned().unwrap_or_default(),
+        }),
+        "NotEquals" => Ok(ActionCondition::NotEquals {
+            element: args.first().cloned().unwrap_or_default(),
+            value: args.get(1).cloned().unwrap_or_default(),
+        }),
+        "Matches" => Ok(ActionCondition::Matches {
+            element: args.first().cloned().unwrap_or_default(),
+            pattern: args.get(1).cloned().unwrap_or_default(),
+        }),
+        "GreaterThan" => Ok(ActionCondition::GreaterThan {
+            element: args.first().cloned().unwrap_or_default(),
+            value: args.get(1).cloned().unwrap_or_default(),
+        }),
+        _ => Err(DeidError::RecipeParse(format!(
+            "unknown condition: {}",
+            name
+        ))),
+    }
+}
+
+/// Split condition arguments on commas, stripping surrounding quotes.
+fn split_condition_args(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                args.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        args.push(trimmed);
+    }
+    args
 }
 
 fn parse_tag_specifier(s: &str) -> Result<TagSpecifier, DeidError> {
     if s.starts_with('(') && s.ends_with(')') {
-        // (GGGG,EEEE) format
         let inner = &s[1..s.len() - 1];
         let (group_str, elem_str) = inner
             .split_once(',')
             .ok_or_else(|| DeidError::RecipeParse(format!("invalid tag format: {}", s)))?;
-        let group = u16::from_str_radix(group_str.trim(), 16)
+        let group_str = group_str.trim();
+        let elem_str = elem_str.trim();
+
+        // Check for group range syntax: (GGGG-GGGG,*) or (GGGG-GGGG,EEEE)
+        if group_str.contains('-') {
+            let (min_str, max_str) = group_str.split_once('-').ok_or_else(|| {
+                DeidError::RecipeParse(format!("invalid group range: {}", group_str))
+            })?;
+            let group_min = u16::from_str_radix(min_str.trim(), 16)
+                .map_err(|_| DeidError::RecipeParse(format!("invalid range start: {}", min_str)))?;
+            let group_max = u16::from_str_radix(max_str.trim(), 16)
+                .map_err(|_| DeidError::RecipeParse(format!("invalid range end: {}", max_str)))?;
+            let element = if elem_str == "*" {
+                None
+            } else {
+                Some(u16::from_str_radix(elem_str, 16).map_err(|_| {
+                    DeidError::RecipeParse(format!("invalid tag element: {}", elem_str))
+                })?)
+            };
+            return Ok(TagSpecifier::GroupRange {
+                group_min,
+                group_max,
+                element,
+            });
+        }
+
+        // (GGGG,EEEE) format
+        let group = u16::from_str_radix(group_str, 16)
             .map_err(|_| DeidError::RecipeParse(format!("invalid tag group: {}", group_str)))?;
-        let element = u16::from_str_radix(elem_str.trim(), 16)
+        let element = u16::from_str_radix(elem_str, 16)
             .map_err(|_| DeidError::RecipeParse(format!("invalid tag element: {}", elem_str)))?;
         Ok(TagSpecifier::TagValue(Tag(group, element)))
     } else if s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -597,10 +831,37 @@ fn parse_action_value(s: &str) -> Result<ActionValue, DeidError> {
     if let Some(var_name) = s.strip_prefix("var:") {
         Ok(ActionValue::Variable(var_name.to_string()))
     } else if let Some(rest) = s.strip_prefix("func:") {
-        let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
-        Ok(ActionValue::Function { name })
+        // Parse func:name or func:name(arg1,arg2)
+        if let Some(paren_start) = rest.find('(') {
+            let name = rest[..paren_start].to_string();
+            let paren_end = rest.rfind(')').unwrap_or(rest.len());
+            let args_str = &rest[paren_start + 1..paren_end];
+            let args = args_str
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            Ok(ActionValue::Function { name, args })
+        } else {
+            let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
+            Ok(ActionValue::Function {
+                name,
+                args: Vec::new(),
+            })
+        }
     } else {
         Ok(ActionValue::Literal(s.to_string()))
+    }
+}
+
+fn parse_keep_group(s: &str) -> Result<KeepGroup, DeidError> {
+    if s.eq_ignore_ascii_case("safeprivateelements") {
+        Ok(KeepGroup::SafePrivateElements)
+    } else {
+        let group = u16::from_str_radix(s, 16).map_err(|_| {
+            DeidError::RecipeParse(format!("invalid group number in KEEP_GROUP: {}", s))
+        })?;
+        Ok(KeepGroup::Group(group))
     }
 }
 
@@ -1230,7 +1491,8 @@ REPLACE SOPInstanceUID func:hashuid
         assert_eq!(
             recipe.header[0].value,
             Some(ActionValue::Function {
-                name: "hashuid".into()
+                name: "hashuid".into(),
+                args: vec![],
             })
         );
     }
@@ -1270,5 +1532,55 @@ missing Modality
 ";
         let recipe = Recipe::parse(input).expect("should parse");
         assert_eq!(recipe.filters[0].filter_type, FilterType::Blacklist);
+    }
+
+    // -- group range tag specifier -------------------------------------------
+
+    #[test]
+    fn parse_group_range_wildcard_element() {
+        let spec = parse_tag_specifier("(6000-601e,*)").expect("should parse");
+        assert_eq!(
+            spec,
+            TagSpecifier::GroupRange {
+                group_min: 0x6000,
+                group_max: 0x601e,
+                element: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_group_range_specific_element() {
+        let spec = parse_tag_specifier("(5000-501e,3000)").expect("should parse");
+        assert_eq!(
+            spec,
+            TagSpecifier::GroupRange {
+                group_min: 0x5000,
+                group_max: 0x501e,
+                element: Some(0x3000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_group_range_in_header_action() {
+        let input = "\
+FORMAT dicom
+
+%header
+
+REMOVE (6000-601e,*)
+";
+        let recipe = Recipe::parse(input).expect("should parse");
+        assert_eq!(recipe.header.len(), 1);
+        assert_eq!(recipe.header[0].action_type, ActionType::Remove);
+        assert_eq!(
+            recipe.header[0].tag,
+            TagSpecifier::GroupRange {
+                group_min: 0x6000,
+                group_max: 0x601e,
+                element: None,
+            }
+        );
     }
 }

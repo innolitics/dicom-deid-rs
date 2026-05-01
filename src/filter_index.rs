@@ -64,6 +64,7 @@ struct ModalityDispatchTree {
 /// - Modality/Manufacturer dispatch to avoid evaluating irrelevant labels
 pub struct FilterIndex {
     blacklist_labels: Vec<CompiledLabel>,
+    whitelist_labels: Vec<CompiledLabel>,
     graylist_tree: ModalityDispatchTree,
 }
 
@@ -71,6 +72,7 @@ impl FilterIndex {
     /// Build a `FilterIndex` from a parsed recipe.
     pub fn new(recipe: &Recipe) -> Self {
         let mut blacklist_labels = Vec::new();
+        let mut whitelist_labels = Vec::new();
         let mut graylist_labels = Vec::new();
 
         for section in &recipe.filters {
@@ -78,6 +80,9 @@ impl FilterIndex {
                 match section.filter_type {
                     FilterType::Blacklist => {
                         blacklist_labels.push(compile_label(label, &[]));
+                    }
+                    FilterType::Whitelist => {
+                        whitelist_labels.push(compile_label(label, &[]));
                     }
                     FilterType::Graylist => {
                         graylist_labels.push(label);
@@ -90,17 +95,33 @@ impl FilterIndex {
 
         FilterIndex {
             blacklist_labels,
+            whitelist_labels,
             graylist_tree,
         }
     }
 
     /// Return the name of the first matching blacklist label, or `None`.
+    ///
+    /// Also rejects files that don't match any whitelist label (if whitelist
+    /// sections exist).
     pub fn blacklist_reason(&self, obj: &InMemDicomObject) -> Option<&str> {
+        // Check explicit blacklist
         for label in &self.blacklist_labels {
             if evaluate_compiled_conditions(&label.conditions, &label.skip_indices, obj) {
                 return Some(&label.name);
             }
         }
+
+        // Check whitelist: file must match at least one whitelist label
+        if !self.whitelist_labels.is_empty() {
+            let matches_any = self.whitelist_labels.iter().any(|label| {
+                evaluate_compiled_conditions(&label.conditions, &label.skip_indices, obj)
+            });
+            if !matches_any {
+                return Some("whitelist_rejected");
+            }
+        }
+
         None
     }
 
@@ -409,18 +430,24 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             };
             field_val.to_lowercase() != value.to_lowercase()
         }
-        Predicate::Missing { field } => obj.element_by_name(field).is_err(),
-        Predicate::Empty { field } => match obj.element_by_name(field) {
-            Ok(elem) => match elem.value() {
-                dicom_core::value::Value::Primitive(prim) => match prim {
-                    dicom_core::value::PrimitiveValue::Empty => true,
-                    _ => elem.value().to_str().map(|s| s.is_empty()).unwrap_or(true),
-                },
-                _ => false,
-            },
-            Err(_) => false,
+        Predicate::StartsWith { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return false;
+            };
+            field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::NotStartsWith { field, value } => {
+            let Some(field_val) = get_field_string(obj, field) else {
+                return true;
+            };
+            !field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::Missing { field } => !crate::filter::field_present(obj, field),
+        Predicate::Empty { field } => match crate::filter::get_field_string(obj, field) {
+            Some(s) => s.is_empty(),
+            None => false,
         },
-        Predicate::Present { field } => obj.element_by_name(field).is_ok(),
+        Predicate::Present { field } => crate::filter::field_present(obj, field),
     }
 }
 
@@ -479,6 +506,7 @@ mod tests {
         Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![
                 FilterSection {
                     filter_type: FilterType::Blacklist,
@@ -875,6 +903,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
