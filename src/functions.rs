@@ -271,24 +271,22 @@ pub fn create_lookup_function(
 /// The DICOM date portion is always the first 8 chars (YYYYMMDD). Anything
 /// after is a time/zone suffix (DT: `HHMMSS[.FFFFFF][+/-HHMM]`) which is
 /// preserved verbatim. Empty values are returned as empty.
-fn jitter_single_timestamp(value: &str, days: i64) -> Result<String, DeidError> {
+fn jitter_single_timestamp(value: &str, days: i64) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Ok(String::new());
+        return String::new();
     }
     if trimmed.len() < 8 {
-        return Err(DeidError::Dicom(format!(
-            "jitter_timestamp_array: value too short to contain a date: '{}'",
-            trimmed
-        )));
+        // If the value is too short to contain a valid date, return an empty value
+        return String::new();
     }
     let (date_part, suffix) = trimmed.split_at(8);
     if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
         let shifted = date + chrono::Duration::days(days);
-        Ok(format!("{}{}", shifted.format("%Y%m%d"), suffix))
+        format!("{}{}", shifted.format("%Y%m%d"), suffix)
     } else {
         // If the date part is invalid, return an empty value
-        Ok(String::new())
+        String::new()
     }
 }
 
@@ -309,11 +307,11 @@ pub fn make_jitter_timestamp_array(days: i64) -> DeidFunction {
         if input.trim().is_empty() {
             return Ok(String::new());
         }
-        let shifted: Result<Vec<String>, DeidError> = input
+        let shifted: Vec<String> = input
             .split('\\')
             .map(|part| jitter_single_timestamp(part, days))
             .collect();
-        Ok(shifted?.join("\\"))
+        Ok(shifted.join("\\"))
     })
 }
 
@@ -678,10 +676,11 @@ mod tests {
     }
 
     #[test]
-    fn jitter_timestamp_array_invalid_date_errors() {
+    fn jitter_timestamp_array_invalid_date_returns_blank() {
         let f = make_jitter_timestamp_array(5);
-        assert!(f("notadate").is_err());
-        assert!(f("2020").is_err());
+        assert_eq!(f("notadate").unwrap(), "");
+        assert_eq!(f("2020").unwrap(), "");
+        assert_eq!(f("2.026032").unwrap(), "");
     }
 
     #[test]
