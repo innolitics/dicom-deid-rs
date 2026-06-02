@@ -64,11 +64,16 @@ pub fn field_present(obj: &InMemDicomObject, field: &str) -> bool {
 ///
 /// Field names in predicates are resolved to DICOM tags by keyword lookup.
 pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool {
+    // Value-comparison predicates (contains/equals/startswith and negations)
+    // treat a MISSING field as the empty string, matching CTP's DicomFilter:
+    // in CTP `Tag.equals("")` is true when the tag is absent. This is what lets
+    // `!ConversionType.equals("")` / `ImageType.equals("")` style gauntlet rules
+    // round-trip correctly through translate-ctp's DNF expansion (which turns
+    // them into positive `equals X ""` conditions). The `missing`/`empty`/
+    // `present` predicates below keep their distinct present-vs-absent meaning.
     match predicate {
         Predicate::Contains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => re.is_match(&field_val),
@@ -76,9 +81,7 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::NotContains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => !re.is_match(&field_val),
@@ -86,27 +89,19 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::Equals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() == value.to_lowercase()
         }
         Predicate::NotEquals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() != value.to_lowercase()
         }
         Predicate::StartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::NotStartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::Missing { field } => !field_present(obj, field),
@@ -350,6 +345,60 @@ mod tests {
         assert!(
             !evaluate_predicate(&pred, &obj),
             "notequals should be case-insensitive"
+        );
+    }
+
+    /// A missing tag must compare equal to "" (CTP `Tag.equals("")` semantics),
+    /// so that translate-ctp's `equals X ""` / `notequals X ""` behaves the same
+    /// as the original CTP `!Tag.equals("")` rules.
+    #[test]
+    fn missing_field_compares_as_empty_string() {
+        let obj = create_test_obj(); // ConversionType / ImageType / Manufacturer absent
+
+        // `equals X ""` is TRUE when X is absent.
+        assert!(
+            evaluate_predicate(
+                &Predicate::Equals {
+                    field: "ConversionType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "equals \"\" should be true for a missing tag"
+        );
+
+        // `notequals X ""` is therefore FALSE when X is absent.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::NotEquals {
+                    field: "ImageType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "notequals \"\" should be false for a missing tag"
+        );
+
+        // A non-empty value still does not match a missing tag.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::Equals {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "equals <non-empty> should be false for a missing tag"
+        );
+        assert!(
+            evaluate_predicate(
+                &Predicate::NotContains {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "notcontains <non-empty> should be true for a missing tag"
         );
     }
 
