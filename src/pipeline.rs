@@ -253,7 +253,7 @@ impl DeidPipeline {
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
         let mut audit_entries: Vec<AuditEntry> = Vec::new();
-        let log_interval = std::cmp::max(total / 20, 1);
+        let log_interval = std::cmp::max(total / 100, 1);
 
         for (i, file_path) in files.iter().enumerate() {
             match self.process_file(file_path) {
