@@ -330,7 +330,19 @@ fn resolve_value(
                 .and_then(|e| e.value().to_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            func(&current)
+            // The lookup function is keyed by `TagName/Value` so a single
+            // table can map multiple tags; prefix the element's DICOM keyword
+            // so it can resolve the right per-tag mapping. Other functions
+            // receive the raw element value.
+            if name.starts_with("lookup") {
+                let keyword = StandardDataDictionary
+                    .by_tag(tag)
+                    .map(|e| e.alias)
+                    .unwrap_or("");
+                func(&format!("{}/{}", keyword, current))
+            } else {
+                func(&current)
+            }
         }
         None => Ok(String::new()),
     }

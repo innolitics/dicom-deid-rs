@@ -240,28 +240,34 @@ pub fn create_lookup_function(
         }
     }
 
-    // Create a lookup function for each tag that has entries
+    // Register two lookup variants that differ only in their no-match
+    // fallback, matching CTP's `@lookup(this, Key, keep|empty)`:
+    //   * "lookup"       -> keep the original value when there is no mapping
+    //   * "lookup_empty" -> blank the element when there is no mapping
+    // Both are keyed by `TagName/Value` input (see metadata::resolve_value).
     let mut functions: HashMap<String, DeidFunction> = HashMap::new();
-
-    // Create a single "lookup" function that handles all tags
     let tag_tables = Arc::new(tag_tables);
-    let lookup_fn: DeidFunction = {
+
+    let make_lookup = |empty_on_miss: bool| -> DeidFunction {
         let tables = Arc::clone(&tag_tables);
         Box::new(move |input: &str| -> Result<String, DeidError> {
-            // Input is the current tag value. We need to search all tag tables
-            // for a matching original value and return the mapped value.
-            // The tag context is passed as "TagName/Value" format.
-            if let Some((tag_name, current_value)) = input.split_once('/')
-                && let Some(table) = tables.get(tag_name)
-                && let Some(mapped) = table.get(current_value)
-            {
-                return Ok(mapped.clone());
+            if let Some((tag_name, current_value)) = input.split_once('/') {
+                if let Some(mapped) = tables.get(tag_name).and_then(|t| t.get(current_value)) {
+                    return Ok(mapped.clone());
+                }
+                return Ok(if empty_on_miss {
+                    String::new()
+                } else {
+                    current_value.to_string()
+                });
             }
-            // No mapping found -- return original value unchanged
+            // No tag context -- return input unchanged.
             Ok(input.to_string())
         })
     };
-    functions.insert("lookup".into(), lookup_fn);
+
+    functions.insert("lookup".into(), make_lookup(false));
+    functions.insert("lookup_empty".into(), make_lookup(true));
 
     Ok(functions)
 }
@@ -503,8 +509,10 @@ mod tests {
         let funcs = create_lookup_function(tmp.path()).unwrap();
         let lookup = &funcs["lookup"];
 
-        assert_eq!(lookup("PatientID/99999").unwrap(), "PatientID/99999");
-        assert_eq!(lookup("Unknown/value").unwrap(), "Unknown/value");
+        // No mapping for the key -> keep the original element value (the part
+        // after the "TagName/" prefix), not the prefixed lookup input.
+        assert_eq!(lookup("PatientID/99999").unwrap(), "99999");
+        assert_eq!(lookup("Unknown/value").unwrap(), "value");
     }
 
     #[test]
@@ -512,7 +520,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let funcs = create_lookup_function(tmp.path()).unwrap();
         let lookup = &funcs["lookup"];
-        assert_eq!(lookup("PatientID/12345").unwrap(), "PatientID/12345");
+        assert_eq!(lookup("PatientID/12345").unwrap(), "12345");
     }
 
     #[test]

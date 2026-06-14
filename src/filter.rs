@@ -115,8 +115,32 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             },
             None => false,
         },
+        Predicate::GreaterThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a > b,
+                _ => false,
+            }
+        }
+        Predicate::LessThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a < b,
+                _ => false,
+            }
+        }
         Predicate::Present { field } => field_present(obj, field),
     }
+}
+
+/// Resolve a DICOM field to a number for numeric comparisons.
+///
+/// DICOM numeric strings (DS/IS) may be multi-valued (backslash-separated);
+/// only the first value is used. Returns `None` when the field is missing or
+/// the value does not parse as a number, so numeric predicates are `false`
+/// for absent/non-numeric fields (matching CTP's `isGreaterThan`/`isLessThan`).
+pub(crate) fn numeric_field(obj: &InMemDicomObject, field: &str) -> Option<f64> {
+    let raw = get_field_string(obj, field)?;
+    let first = raw.split('\\').next().unwrap_or("").trim();
+    first.parse::<f64>().ok()
 }
 
 /// Evaluate a list of conditions with logical operators against a DICOM object.
@@ -345,6 +369,52 @@ mod tests {
         assert!(
             !evaluate_predicate(&pred, &obj),
             "notequals should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn greaterthan_and_lessthan_compare_numeric_values() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SLICE_THICKNESS, VR::DS, "3.0");
+
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        let lt = Predicate::LessThan {
+            field: "SliceThickness".into(),
+            value: "5".into(),
+        };
+        assert!(evaluate_predicate(&gt, &obj), "3.0 > 1");
+        assert!(evaluate_predicate(&lt, &obj), "3.0 < 5");
+
+        // Out-of-range value fails the window.
+        let mut thin = create_test_obj();
+        put_str(&mut thin, tags::SLICE_THICKNESS, VR::DS, "0.5");
+        assert!(
+            !evaluate_predicate(&gt, &thin),
+            "0.5 is not greater than 1"
+        );
+    }
+
+    #[test]
+    fn numeric_predicate_false_for_missing_or_nonnumeric_field() {
+        let obj = create_test_obj(); // no SliceThickness
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        assert!(!evaluate_predicate(&gt, &obj), "missing field => false");
+
+        let mut text = create_test_obj();
+        put_str(&mut text, tags::MODALITY, VR::CS, "CT");
+        let gt_text = Predicate::GreaterThan {
+            field: "Modality".into(),
+            value: "1".into(),
+        };
+        assert!(
+            !evaluate_predicate(&gt_text, &text),
+            "non-numeric field => false"
         );
     }
 

@@ -432,6 +432,18 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             let field_val = get_field_string(obj, field).unwrap_or_default();
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
+        Predicate::GreaterThan { field, value } => {
+            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a > b,
+                _ => false,
+            }
+        }
+        Predicate::LessThan { field, value } => {
+            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a < b,
+                _ => false,
+            }
+        }
         Predicate::Missing { field } => !crate::filter::field_present(obj, field),
         Predicate::Empty { field } => match crate::filter::get_field_string(obj, field) {
             Some(s) => s.is_empty(),
