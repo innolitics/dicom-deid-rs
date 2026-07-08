@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Generate a DICOM UID from the SHA-256 hash of the input value.
 ///
@@ -127,14 +127,31 @@ fn round(input: &str) -> Result<String, DeidError> {
     Ok(format!("{}{}", rounded, suffix))
 }
 
-/// Return a deterministic hash-based integer for the input.
+/// Build the stateful `integer` function.
 ///
-/// True sequential integers require shared state which will be added later.
-fn integer(input: &str) -> Result<String, DeidError> {
-    let hash = Sha256::digest(input.as_bytes());
-    let bytes: [u8; 8] = hash[..8].try_into().expect("8 bytes");
-    let num = u64::from_be_bytes(bytes) % 100000;
-    Ok(format!("{:05}", num))
+/// Assigns a stable, unique, sequential number (zero-padded to 5 digits) to each
+/// distinct input value seen during a run. The recipe supplies the *source*
+/// field to key on — e.g. `@integer(SeriesInstanceUID,…)` becomes
+/// `func:integer(SeriesInstanceUID)`, so this receives each series' (unique)
+/// SeriesInstanceUID and renumbers SeriesNumber uniquely per series. Distinct
+/// inputs always get distinct numbers (no hash collisions); the same input is
+/// stable within a run, so every instance of a series gets the same number.
+///
+/// State is per-run (a fresh map is created by `default_functions`), guarded by
+/// a mutex so it is safe to share across the recipe's function table.
+fn make_integer() -> DeidFunction {
+    let assigned: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    Box::new(move |input: &str| -> Result<String, DeidError> {
+        let mut map = assigned
+            .lock()
+            .map_err(|_| DeidError::Dicom("integer: counter mutex poisoned".into()))?;
+        if let Some(existing) = map.get(input) {
+            return Ok(existing.clone());
+        }
+        let value = format!("{:05}", map.len() + 1);
+        map.insert(input.to_string(), value.clone());
+        Ok(value)
+    })
 }
 
 /// Extract initials from DICOM PersonName format (Last^First^Middle).
@@ -333,7 +350,7 @@ pub fn default_functions() -> HashMap<String, DeidFunction> {
     map.insert("time".into(), Box::new(time));
     map.insert("blank".into(), Box::new(blank));
     map.insert("round".into(), Box::new(round));
-    map.insert("integer".into(), Box::new(integer));
+    map.insert("integer".into(), make_integer());
     map.insert("initials".into(), Box::new(initials));
     map.insert("contents".into(), Box::new(contents));
     map.insert("value".into(), Box::new(value));
@@ -567,6 +584,7 @@ mod tests {
 
     #[test]
     fn integer_five_digits() {
+        let integer = make_integer();
         let result = integer("test input").unwrap();
         assert_eq!(result.len(), 5, "integer should be 5 chars: {}", result);
         assert!(
@@ -577,10 +595,25 @@ mod tests {
     }
 
     #[test]
-    fn integer_deterministic() {
+    fn integer_stable_per_input() {
+        let integer = make_integer();
         let a = integer("hello").unwrap();
         let b = integer("hello").unwrap();
-        assert_eq!(a, b);
+        assert_eq!(a, b, "same input must yield the same number within a run");
+    }
+
+    #[test]
+    fn integer_unique_per_distinct_input() {
+        // Distinct series (distinct SeriesInstanceUIDs) must never collide, even
+        // if they shared an original SeriesNumber.
+        let integer = make_integer();
+        let a = integer("series-uid-A").unwrap();
+        let b = integer("series-uid-B").unwrap();
+        let c = integer("series-uid-C").unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert_eq!(integer("series-uid-A").unwrap(), a, "still stable");
     }
 
     #[test]

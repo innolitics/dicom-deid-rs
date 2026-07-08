@@ -388,8 +388,21 @@ fn translate_action(action_text: &str, tag: &str) -> Option<String> {
     }
 
     // Identifier functions
-    if action.starts_with("@integer(") {
-        return Some(format!("REPLACE {} func:integer", tag));
+    if let Some(rest) = action.strip_prefix("@integer(") {
+        // CTP @integer(SourceField, keytype, width) renumbers `tag` from the
+        // value of SourceField. Carry the source field through so the engine
+        // derives the number from it (e.g. SeriesInstanceUID) rather than from
+        // the target tag's own value.
+        let field = rest
+            .trim_end_matches(')')
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if field.is_empty() {
+            return Some(format!("REPLACE {} func:integer", tag));
+        }
+        return Some(format!("REPLACE {} func:integer({})", tag, field));
     }
     if action.starts_with("@initials(") {
         return Some(format!("REPLACE_ONLY {} func:initials", tag));
@@ -1373,7 +1386,7 @@ mod tests {
     fn translate_always_integer() {
         assert_eq!(
             translate_action("@always()@integer(SeriesInstanceUID,seriesnum,5)", "T"),
-            Some("REPLACE T func:integer".into())
+            Some("REPLACE T func:integer(SeriesInstanceUID)".into())
         );
     }
 
@@ -1450,7 +1463,7 @@ mod tests {
     fn translate_integer() {
         assert_eq!(
             translate_action("@integer(SeriesInstanceUID,seriesnum,5)", "T"),
-            Some("REPLACE T func:integer".into())
+            Some("REPLACE T func:integer(SeriesInstanceUID)".into())
         );
     }
 

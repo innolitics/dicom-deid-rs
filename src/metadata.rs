@@ -46,8 +46,15 @@ pub fn apply_header_actions(
         }
     }
 
-    // Apply each winning action
-    for (tag, action) in &winning {
+    // Apply each winning action in a deterministic (tag-ordered) sequence.
+    // HashMap iteration order is unspecified; a fixed order ensures functions
+    // that read another element (e.g. `func:integer(SeriesInstanceUID)`) see a
+    // consistent value across every instance of a series, so a series is
+    // renumbered identically for all of its files (no split) while distinct
+    // series still get distinct numbers.
+    let mut ordered: Vec<(Tag, &HeaderAction)> = winning.iter().map(|(t, a)| (*t, *a)).collect();
+    ordered.sort_by_key(|(tag, _)| (tag.group(), tag.element()));
+    for (tag, action) in &ordered {
         // Check condition before executing the action
         if action
             .condition
@@ -320,13 +327,20 @@ fn resolve_value(
             .get(name)
             .cloned()
             .ok_or_else(|| DeidError::VariableNotFound(name.clone())),
-        Some(ActionValue::Function { name, .. }) => {
+        Some(ActionValue::Function { name, args }) => {
             let func = functions
                 .get(name)
                 .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
-            let current = obj
-                .element(tag)
-                .ok()
+            // A function may name a source element to read its input from — e.g.
+            // `func:integer(SeriesInstanceUID)` renumbers SeriesNumber from the
+            // (unique) SeriesInstanceUID. Otherwise it operates on the value of
+            // the tag being replaced.
+            let source_elem = args
+                .first()
+                .and_then(|field| StandardDataDictionary.by_name(field))
+                .and_then(|entry| obj.element(entry.tag()).ok());
+            let current = source_elem
+                .or_else(|| obj.element(tag).ok())
                 .and_then(|e| e.value().to_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_default();
