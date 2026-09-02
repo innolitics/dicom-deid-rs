@@ -25,6 +25,7 @@ impl FromKwargs for HashUIDArgs {
 }
 
 // Returns a wrapper function to generate typed arguments from kwargs, as required by the underlying function
+#[cfg(feature = "parallel")]
 pub fn with_args<A, F>(f: F) -> DeidFunction
 where
     A: FromKwargs,
@@ -35,10 +36,29 @@ where
         f(input, &args)
     })
 }
+#[cfg(not(feature = "parallel"))]
+pub fn with_args<A, F>(f: F) -> DeidFunction
+where
+    A: FromKwargs,
+    F: Fn(&str, &A) -> Result<String, DeidError> + 'static,
+{
+    Box::new(move |input, kwargs| {
+        let args = A::from_kwargs(kwargs)?;
+        f(input, &args)
+    })
+}
 
+#[cfg(feature = "parallel")]
 pub fn no_args<F>(f: F) -> DeidFunction
 where
     F: Fn(&str) -> Result<String, DeidError> + Send + Sync + 'static,
+{
+    Box::new(move |input, _kwargs| f(input))
+}
+#[cfg(not(feature = "parallel"))]
+pub fn no_args<F>(f: F) -> DeidFunction
+where
+    F: Fn(&str) -> Result<String, DeidError> + 'static,
 {
     Box::new(move |input, _kwargs| f(input))
 }
