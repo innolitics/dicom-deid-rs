@@ -46,7 +46,9 @@ r-3-4-1 The software must support specifying a tag by its keyword (e.g. PatientI
 r-3-4-2 The software must support specifying a tag by its tag value in parenthesized format (e.g. (0002,0080)) or bare hex format (e.g. 00120063)
 r-3-4-3 The software must support specifying private tags by its group, private creator, and element offset
 r-3-5 The software must support pattern matching of tags based on regexes of tag keywords or tag values, and applying deid operations to all tags matching the pattern
-r-3-6 The software must support the use of pre-defined functions referenced via func:<name> syntax in the recipe to execute logic. Functions may accept keyword arguments.
+r-3-6 Function references
+r-3-6-1 The software must support the use of pre-defined functions referenced via func:<name> syntax in the recipe to execute logic.
+r-3-6-2 Functions must support optional keyword arguments, which may reference variables via the var:<name> syntax.
 r-3-7 The software must support applying a "jitter" to date and datetime fields to shift the value by the specified number of days. DateTime (DT) fields must also be supported, preserving the time component while shifting only the date portion. Jittering a blank or empty date field must be a no-op (no error).
 r-3-8 The software must support referencing variables within the recipe via var:<NAME> syntax to allow for dynamic values
 r-3-9 The software must support blanking a DICOM tag (setting its value to empty/null) while keeping the tag present in the file
