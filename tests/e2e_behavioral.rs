@@ -548,11 +548,11 @@ fn test_recipe_parses_and_applies() {
     let mut funcs: HashMap<String, DeidFunction> = HashMap::new();
     funcs.insert(
         "hashuid".into(),
-        Box::new(|input: &str| Ok(format!("hashed-{}", input))),
+        Box::new(|input: &str, _kwargs: &HashMap<String, String>| Ok(format!("hashed-{}", input))),
     );
     funcs.insert(
         "hash_accession".into(),
-        Box::new(|input: &str| Ok(format!("acc-{}", input))),
+        Box::new(|input: &str, _kwargs: &HashMap<String, String>| Ok(format!("acc-{}", input))),
     );
 
     apply_header_actions(&recipe.header, &vars, &funcs, &mut obj)
