@@ -1,5 +1,6 @@
 use crate::error::DeidError;
 use dicom_core::Tag;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -85,10 +86,19 @@ pub enum ActionType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum FunctionArg {
+    Literal(String),
+    Variable(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ActionValue {
     Literal(String),
     Variable(String),
-    Function { name: String },
+    Function {
+        name: String,
+        kwargs: HashMap<String, FunctionArg>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -593,12 +603,26 @@ fn parse_tag_specifier(s: &str) -> Result<TagSpecifier, DeidError> {
     }
 }
 
+fn parse_function_arg(s: &str) -> Result<(String, FunctionArg), DeidError> {
+    let (kw, arg) = s
+        .split_once('=')
+        .ok_or_else(|| DeidError::RecipeParse(format!("invalid function kwarg: {}", s)))?;
+    let func_arg = match arg.strip_prefix("var:") {
+        Some(variable) => FunctionArg::Variable(variable.to_string()),
+        _ => FunctionArg::Literal(arg.to_string()),
+    };
+    Ok((kw.to_string(), func_arg))
+}
+
 fn parse_action_value(s: &str) -> Result<ActionValue, DeidError> {
     if let Some(var_name) = s.strip_prefix("var:") {
         Ok(ActionValue::Variable(var_name.to_string()))
     } else if let Some(rest) = s.strip_prefix("func:") {
-        let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
-        Ok(ActionValue::Function { name })
+        let mut tokens = rest.split_whitespace();
+        let name = tokens.next().unwrap_or(rest).to_string();
+        let kwargs: HashMap<String, FunctionArg> =
+            tokens.map(parse_function_arg).collect::<Result<_, _>>()?;
+        Ok(ActionValue::Function { name, kwargs })
     } else {
         Ok(ActionValue::Literal(s.to_string()))
     }
@@ -1230,7 +1254,8 @@ REPLACE SOPInstanceUID func:hashuid
         assert_eq!(
             recipe.header[0].value,
             Some(ActionValue::Function {
-                name: "hashuid".into()
+                name: "hashuid".into(),
+                kwargs: HashMap::new(),
             })
         );
     }
@@ -1270,5 +1295,71 @@ missing Modality
 ";
         let recipe = Recipe::parse(input).expect("should parse");
         assert_eq!(recipe.filters[0].filter_type, FilterType::Blacklist);
+    }
+
+    // -- r-3-6-1 --------------------------------------------------------------
+
+    /// Requirement r-3-6-1
+    #[test]
+    fn r3_6_1_parse_function_no_kwargs() {
+        let input = "\
+FORMAT dicom
+
+%header
+
+REPLACE SOPInstanceUID func:hashuid
+";
+        let recipe = Recipe::parse(input).expect("should parse");
+        assert_eq!(
+            recipe.header[0].value,
+            Some(ActionValue::Function {
+                name: "hashuid".into(),
+                kwargs: HashMap::new(),
+            })
+        );
+    }
+
+    // -- r-3-6-2 ------------------------------------------------------------
+
+    /// Requirement r-3-6-2
+    #[test]
+    fn r3_6_2_parse_function_kwargs() {
+        let input = "\
+FORMAT dicom
+
+%header
+
+REPLACE SOPInstanceUID func:hashuid  kw1=arg1  kw2=arg2 kw3=var:some_var
+";
+        let recipe = Recipe::parse(input).expect("should parse");
+        let kwargs = HashMap::from([
+            ("kw1".to_string(), FunctionArg::Literal("arg1".to_string())),
+            ("kw2".to_string(), FunctionArg::Literal("arg2".to_string())),
+            (
+                "kw3".to_string(),
+                FunctionArg::Variable("some_var".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            recipe.header[0].value,
+            Some(ActionValue::Function {
+                name: "hashuid".into(),
+                kwargs,
+            })
+        );
+    }
+
+    /// Requirement r-3-6-2
+    #[test]
+    fn r3_6_2_reject_malformed_function_kwarg() {
+        let input = "\
+FORMAT dicom
+
+%header
+
+REPLACE SOPInstanceUID func:hashuid kw1
+";
+        let result = Recipe::parse(input);
+        assert!(result.is_err(), "kwarg missing '=' should be rejected");
     }
 }

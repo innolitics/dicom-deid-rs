@@ -1,5 +1,5 @@
 use crate::error::DeidError;
-use crate::recipe::{ActionType, ActionValue, HeaderAction};
+use crate::recipe::{ActionType, ActionValue, FunctionArg, HeaderAction};
 use crate::tag::resolve_tags;
 use chrono::NaiveDate;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
@@ -11,10 +11,14 @@ use dicom_object::InMemDicomObject;
 use std::collections::HashMap;
 
 /// A function that can be referenced via `func:<name>` in a recipe.
+///
+/// Receives the current field value and the recipe's kwargs for the call
+/// (with any `var:<name>` arguments already resolved to their runtime values).
 #[cfg(feature = "parallel")]
-pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError> + Send + Sync>;
+pub type DeidFunction =
+    Box<dyn Fn(&str, &HashMap<String, String>) -> Result<String, DeidError> + Send + Sync>;
 #[cfg(not(feature = "parallel"))]
-pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError>>;
+pub type DeidFunction = Box<dyn Fn(&str, &HashMap<String, String>) -> Result<String, DeidError>>;
 
 /// Apply the given header actions to a DICOM object.
 ///
@@ -215,7 +219,7 @@ fn resolve_value(
             .get(name)
             .cloned()
             .ok_or_else(|| DeidError::VariableNotFound(name.clone())),
-        Some(ActionValue::Function { name }) => {
+        Some(ActionValue::Function { name, kwargs }) => {
             let func = functions
                 .get(name)
                 .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
@@ -225,10 +229,32 @@ fn resolve_value(
                 .and_then(|e| e.value().to_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            func(&current)
+            let resolved_kwargs = resolve_kwargs(kwargs, variables)?;
+            func(&current, &resolved_kwargs)
         }
         None => Ok(String::new()),
     }
+}
+
+/// Resolve a recipe function's kwargs into their runtime string values,
+/// looking up any `var:<name>` arguments in `variables`.
+fn resolve_kwargs(
+    kwargs: &HashMap<String, FunctionArg>,
+    variables: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, DeidError> {
+    kwargs
+        .iter()
+        .map(|(kw, arg)| {
+            let value = match arg {
+                FunctionArg::Literal(s) => s.clone(),
+                FunctionArg::Variable(name) => variables
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| DeidError::VariableNotFound(name.clone()))?,
+            };
+            Ok((kw.clone(), value))
+        })
+        .collect()
 }
 
 fn lookup_vr(obj: &InMemDicomObject, tag: Tag) -> VR {
@@ -353,11 +379,11 @@ mod tests {
         );
     }
 
-    // -- r-3-6 ---------------------------------------------------------------
+    // -- r-3-6-1 --------------------------------------------------------------
 
-    /// Requirement r-3-6
+    /// Requirement r-3-6-1
     #[test]
-    fn r3_6_function_reference_applied() {
+    fn r3_6_1_function_reference_applied() {
         let mut obj = create_test_obj();
         put_str(
             &mut obj,
@@ -369,7 +395,9 @@ mod tests {
         let mut functions: HashMap<String, DeidFunction> = HashMap::new();
         functions.insert(
             "hashuid".into(),
-            Box::new(|input: &str| Ok(format!("hashed-{}", input))),
+            Box::new(|input: &str, _kwargs: &HashMap<String, String>| {
+                Ok(format!("hashed-{}", input))
+            }),
         );
 
         let actions = vec![HeaderAction {
@@ -377,6 +405,7 @@ mod tests {
             tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
             value: Some(ActionValue::Function {
                 name: "hashuid".into(),
+                kwargs: HashMap::new(),
             }),
         }];
 
@@ -390,9 +419,9 @@ mod tests {
         assert_eq!(val.as_ref(), "hashed-1.2.3.4.5.6.7.8.9");
     }
 
-    /// Requirement r-3-6
+    /// Requirement r-3-6-1
     #[test]
-    fn r3_6_unknown_function_returns_error() {
+    fn r3_6_1_unknown_function_returns_error() {
         let mut obj = create_test_obj();
         put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
 
@@ -401,11 +430,127 @@ mod tests {
             tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
             value: Some(ActionValue::Function {
                 name: "nonexistent".into(),
+                kwargs: HashMap::new(),
             }),
         }];
 
         let result = apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj);
         assert!(result.is_err(), "unknown function should produce an error");
+    }
+
+    // -- r-3-6-2 --------------------------------------------------------------
+
+    /// Requirement r-3-6-2
+    #[test]
+    fn r3_6_2_function_kwargs_are_passed_through() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
+
+        let mut functions: HashMap<String, DeidFunction> = HashMap::new();
+        functions.insert(
+            "with_suffix".into(),
+            Box::new(|input: &str, kwargs: &HashMap<String, String>| {
+                let suffix = kwargs.get("suffix").cloned().unwrap_or_default();
+                Ok(format!("{}-{}", input, suffix))
+            }),
+        );
+
+        let kwargs = HashMap::from([(
+            "suffix".to_string(),
+            FunctionArg::Literal("literal-arg".to_string()),
+        )]);
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Replace,
+            tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
+            value: Some(ActionValue::Function {
+                name: "with_suffix".into(),
+                kwargs,
+            }),
+        }];
+
+        apply_header_actions(&actions, &empty_vars(), &functions, &mut obj)
+            .expect("should succeed");
+
+        let elem = obj
+            .element(tags::SOP_INSTANCE_UID)
+            .expect("tag should be present");
+        let val = elem.value().to_str().expect("should read value");
+        assert_eq!(val.as_ref(), "1.2.3.4-literal-arg");
+    }
+
+    /// Requirement r-3-6-2
+    #[test]
+    fn r3_6_2_function_kwargs_resolve_variables() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
+
+        let mut functions: HashMap<String, DeidFunction> = HashMap::new();
+        functions.insert(
+            "with_suffix".into(),
+            Box::new(|input: &str, kwargs: &HashMap<String, String>| {
+                let suffix = kwargs.get("suffix").cloned().unwrap_or_default();
+                Ok(format!("{}-{}", input, suffix))
+            }),
+        );
+
+        let mut variables = HashMap::new();
+        variables.insert("SUFFIX".to_string(), "from-var".to_string());
+
+        let kwargs = HashMap::from([(
+            "suffix".to_string(),
+            FunctionArg::Variable("SUFFIX".to_string()),
+        )]);
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Replace,
+            tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
+            value: Some(ActionValue::Function {
+                name: "with_suffix".into(),
+                kwargs,
+            }),
+        }];
+
+        apply_header_actions(&actions, &variables, &functions, &mut obj).expect("should succeed");
+
+        let elem = obj
+            .element(tags::SOP_INSTANCE_UID)
+            .expect("tag should be present");
+        let val = elem.value().to_str().expect("should read value");
+        assert_eq!(val.as_ref(), "1.2.3.4-from-var");
+    }
+
+    /// Requirement r-3-6-2
+    #[test]
+    fn r3_6_2_function_kwargs_missing_variable_errors() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
+
+        let mut functions: HashMap<String, DeidFunction> = HashMap::new();
+        functions.insert(
+            "with_suffix".into(),
+            Box::new(|input: &str, kwargs: &HashMap<String, String>| {
+                let suffix = kwargs.get("suffix").cloned().unwrap_or_default();
+                Ok(format!("{}-{}", input, suffix))
+            }),
+        );
+
+        let kwargs = HashMap::from([(
+            "suffix".to_string(),
+            FunctionArg::Variable("UNDEFINED".to_string()),
+        )]);
+        let actions = vec![HeaderAction {
+            action_type: ActionType::Replace,
+            tag: TagSpecifier::Keyword("SOPInstanceUID".into()),
+            value: Some(ActionValue::Function {
+                name: "with_suffix".into(),
+                kwargs,
+            }),
+        }];
+
+        let result = apply_header_actions(&actions, &empty_vars(), &functions, &mut obj);
+        assert!(
+            result.is_err(),
+            "kwarg referencing an undefined variable should produce an error"
+        );
     }
 
     // -- r-3-7 ---------------------------------------------------------------
