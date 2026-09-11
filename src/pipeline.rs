@@ -356,6 +356,11 @@ impl DeidPipeline {
             metadata::remove_unspecified_elements(&mut obj, &self.recipe);
         }
 
+        // Reconcile the file meta group with the de-identified dataset. Must run
+        // after all actions so (0002,0002)/(0002,0003) match the rewritten
+        // SOPClassUID/SOPInstanceUID rather than leaking the originals.
+        metadata::finalize_file_meta(&mut obj);
+
         // Snapshot tags after de-identification
         let post = extract_tags(&obj, AUDIT_TAGS);
 

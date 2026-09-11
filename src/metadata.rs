@@ -1,13 +1,14 @@
 use crate::error::DeidError;
+use crate::file_meta;
 use crate::recipe::{ActionCondition, ActionType, ActionValue, HeaderAction, KeepGroup, Recipe};
-use crate::tag::resolve_tags;
+use crate::tag::{resolve_tags, resolve_tags_in_file_meta};
 use chrono::NaiveDate;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::Header;
 use dicom_core::value::{DataSetSequence, PrimitiveValue, Value};
 use dicom_core::{DataElement, Length, Tag, VR};
 use dicom_dictionary_std::StandardDataDictionary;
-use dicom_object::InMemDicomObject;
+use dicom_object::{FileDicomObject, InMemDicomObject};
 use std::collections::{HashMap, HashSet};
 
 /// A function that can be referenced via `func:<name>` in a recipe.
@@ -16,23 +17,37 @@ pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError> + Send + S
 #[cfg(not(feature = "parallel"))]
 pub type DeidFunction = Box<dyn Fn(&str) -> Result<String, DeidError>>;
 
-/// Apply the given header actions to a DICOM object.
+/// Apply the given header actions to a DICOM file object.
 ///
 /// Actions are sorted by the precedence hierarchy before application:
 /// KEEP > ADD > REPLACE > JITTER > REMOVE > BLANK
 ///
 /// When multiple actions target the same tag, the highest-precedence action wins.
+///
+/// Actions targeting the File Meta Information group (0002) are applied to the
+/// file meta table rather than the main data set; see [`apply_file_meta_actions`].
 pub fn apply_header_actions(
     actions: &[HeaderAction],
     variables: &HashMap<String, String>,
     functions: &HashMap<String, DeidFunction>,
-    obj: &mut InMemDicomObject,
+    obj: &mut FileDicomObject<InMemDicomObject>,
 ) -> Result<(), DeidError> {
-    // Build winning-action map based on precedence
+    apply_dataset_actions(actions, variables, functions, obj)?;
+    apply_file_meta_actions(actions, variables, functions, obj)
+}
+
+/// Given a set of actions and a way to resolve each one's tag specifier, build the
+/// map of tag to the highest-precedence action targeting it (r-3-11).
+fn resolve_winning_actions<F>(
+    actions: &[HeaderAction],
+    mut resolve: F,
+) -> Result<HashMap<Tag, &HeaderAction>, DeidError>
+where
+    F: FnMut(&HeaderAction) -> Result<Vec<Tag>, DeidError>,
+{
     let mut winning: HashMap<Tag, &HeaderAction> = HashMap::new();
     for action in actions {
-        let tags = resolve_tags(&action.tag, obj)?;
-        for tag in tags {
+        for tag in resolve(action)? {
             let should_replace = match winning.get(&tag) {
                 Some(existing) => {
                     action_precedence(&action.action_type)
@@ -45,9 +60,30 @@ pub fn apply_header_actions(
             }
         }
     }
+    Ok(winning)
+}
+
+/// Apply header actions to the main data set.
+///
+/// Group 0002 tags are skipped here: the file meta group is not part of the data
+/// set, and writing a group-0002 element into it would produce a file with a
+/// duplicate, wrongly-encoded meta group. [`apply_file_meta_actions`] handles them.
+///
+/// This is the recursive half of [`apply_header_actions`] — it calls itself for
+/// the item data sets of sequences marked with `@process()`.
+pub(crate) fn apply_dataset_actions(
+    actions: &[HeaderAction],
+    variables: &HashMap<String, String>,
+    functions: &HashMap<String, DeidFunction>,
+    obj: &mut InMemDicomObject,
+) -> Result<(), DeidError> {
+    let winning = resolve_winning_actions(actions, |action| resolve_tags(&action.tag, obj))?;
 
     // Apply each winning action
     for (tag, action) in &winning {
+        if file_meta::is_file_meta(*tag) {
+            continue;
+        }
         // Check condition before executing the action
         if action
             .condition
@@ -238,7 +274,7 @@ pub fn apply_header_actions(
                             break;
                         }
                         if let Err(e) =
-                            apply_header_actions(&child_actions, variables, functions, item)
+                            apply_dataset_actions(&child_actions, variables, functions, item)
                         {
                             seq_error = Some(e);
                         }
@@ -255,8 +291,163 @@ pub fn apply_header_actions(
     Ok(())
 }
 
-/// Remove all private tags (tags with odd group numbers) from a DICOM object.
-pub fn remove_private_tags(obj: &mut InMemDicomObject) {
+/// Apply header actions to the File Meta Information group (0002).
+///
+/// This gives recipes the same reach over group 0002 that the reference python
+/// `deid` implementation provides (see `resources/deid/deid/tests/test_file_meta.py`),
+/// so a rule such as `REPLACE MediaStorageSOPInstanceUID func:hashuid` takes effect.
+///
+/// Structural attributes listed in [`file_meta::PROTECTED_TAGS`] are never
+/// modified, mirroring `resources/deid/deid/dicom/config.json`. JITTER, APPEND and
+/// PROCESS have no meaning in group 0002 (no date, multi-valued, or sequence
+/// attributes) and are no-ops.
+pub fn apply_file_meta_actions(
+    actions: &[HeaderAction],
+    variables: &HashMap<String, String>,
+    functions: &HashMap<String, DeidFunction>,
+    obj: &mut FileDicomObject<InMemDicomObject>,
+) -> Result<(), DeidError> {
+    let winning = resolve_winning_actions(actions, |action| {
+        resolve_tags_in_file_meta(&action.tag, obj.meta())
+    })?;
+
+    // Only group 0002 tags that are not structurally protected are eligible.
+    let mut eligible: Vec<(Tag, &HeaderAction)> = winning
+        .into_iter()
+        .filter(|(tag, _)| file_meta::is_file_meta(*tag) && !file_meta::is_protected(*tag))
+        .collect();
+    // Deterministic order so the outcome does not depend on hash iteration order.
+    eligible.sort_by_key(|(tag, _)| *tag);
+
+    // Conditions reference data set keywords (e.g. Modality), so evaluate them
+    // against the data set before deciding whether the action applies.
+    let mut pending: Vec<(Tag, &HeaderAction, Option<String>)> = Vec::new();
+    for (tag, action) in eligible {
+        if action
+            .condition
+            .as_ref()
+            .is_some_and(|c| !evaluate_condition(c, obj))
+        {
+            continue;
+        }
+
+        // `func:` values are computed from the attribute's current value, which
+        // must be read (and un-padded) before any mutation.
+        let needs_value = matches!(
+            action.action_type,
+            ActionType::Add | ActionType::Replace | ActionType::ReplaceOnly | ActionType::Blank
+        );
+        let value = if needs_value {
+            let current = file_meta::get(obj.meta(), tag).unwrap_or_default();
+            Some(resolve_value_from(
+                &action.value,
+                variables,
+                functions,
+                &current,
+            )?)
+        } else {
+            None
+        };
+        pending.push((tag, action, value));
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    // A single update_meta call so the group length is recalculated once.
+    obj.update_meta(|meta| {
+        for (tag, action, value) in &pending {
+            match action.action_type {
+                ActionType::Keep
+                | ActionType::Jitter
+                | ActionType::Append
+                | ActionType::Process => {}
+                ActionType::Add => {
+                    if !file_meta::is_present(meta, *tag) {
+                        file_meta::set(meta, *tag, value.as_deref().unwrap_or_default());
+                    }
+                }
+                ActionType::Replace => {
+                    file_meta::set(meta, *tag, value.as_deref().unwrap_or_default());
+                }
+                ActionType::ReplaceOnly => {
+                    if file_meta::is_present(meta, *tag) {
+                        file_meta::set(meta, *tag, value.as_deref().unwrap_or_default());
+                    }
+                }
+                ActionType::Blank => {
+                    file_meta::set(meta, *tag, "");
+                }
+                ActionType::Remove => {
+                    file_meta::remove(meta, *tag);
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Reconcile the file meta group with the de-identified data set.
+///
+/// PS3.10 requires MediaStorageSOPClassUID (0002,0002) and
+/// MediaStorageSOPInstanceUID (0002,0003) to match the data set's SOPClassUID
+/// (0008,0016) and SOPInstanceUID (0008,0018). Because the recipe rewrites the
+/// data set UIDs, the file meta copies must be re-derived afterwards or the output
+/// file leaks the original, identifying SOP Instance UID.
+///
+/// This mirrors CTP, whose `DICOMAnonymizer` regenerates the file meta group from
+/// the anonymized data set via `DcmObjectFactory.newFileMetaInfo`. It runs after
+/// all recipe actions so conformance never depends on a recipe rule being present.
+///
+/// Also clears the application entity titles and private information, which
+/// identify the originating site rather than the data. TransferSyntaxUID and
+/// ImplementationClassUID are left alone — the former is owned by the pixel
+/// pipeline, and both are on the reference implementation's protected list.
+pub fn finalize_file_meta(obj: &mut FileDicomObject<InMemDicomObject>) {
+    let sop_class_uid = dataset_uid(obj, Tag(0x0008, 0x0016));
+    let sop_instance_uid = dataset_uid(obj, Tag(0x0008, 0x0018));
+
+    obj.update_meta(|meta| {
+        if let Some(uid) = &sop_class_uid {
+            file_meta::set(meta, file_meta::MEDIA_STORAGE_SOP_CLASS_UID, uid);
+        }
+        if let Some(uid) = &sop_instance_uid {
+            file_meta::set(meta, file_meta::MEDIA_STORAGE_SOP_INSTANCE_UID, uid);
+        }
+        file_meta::remove(meta, file_meta::SOURCE_APPLICATION_ENTITY_TITLE);
+        file_meta::remove(meta, file_meta::SENDING_APPLICATION_ENTITY_TITLE);
+        file_meta::remove(meta, file_meta::RECEIVING_APPLICATION_ENTITY_TITLE);
+        file_meta::remove(meta, file_meta::PRIVATE_INFORMATION_CREATOR_UID);
+        file_meta::remove(meta, file_meta::PRIVATE_INFORMATION);
+    });
+}
+
+/// Read a non-empty, un-padded UID from the data set.
+fn dataset_uid(obj: &InMemDicomObject, tag: Tag) -> Option<String> {
+    let value = obj.element(tag).ok()?.value().to_str().ok()?;
+    let trimmed = value.trim_end_matches(|c: char| c.is_whitespace() || c == '\0');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Remove all private tags from a DICOM file object.
+///
+/// This covers odd-group elements in the data set (recursively, through
+/// sequences) and, in the File Meta Information group, PrivateInformationCreatorUID
+/// (0002,0100) and PrivateInformation (0002,0102) — group 0002 is even, so those
+/// two are not reachable by the odd-group rule despite holding private data.
+pub fn remove_private_tags(obj: &mut FileDicomObject<InMemDicomObject>) {
+    remove_private_dataset_tags(obj);
+    obj.update_meta(|meta| {
+        file_meta::remove(meta, file_meta::PRIVATE_INFORMATION_CREATOR_UID);
+        file_meta::remove(meta, file_meta::PRIVATE_INFORMATION);
+    });
+}
+
+/// Remove all private tags (tags with odd group numbers) from a data set,
+/// recursing into sequence items.
+pub(crate) fn remove_private_dataset_tags(obj: &mut InMemDicomObject) {
     let private_tags: Vec<Tag> = obj
         .iter()
         .filter(|e| e.tag().group() % 2 != 0)
@@ -281,7 +472,7 @@ pub fn remove_private_tags(obj: &mut InMemDicomObject) {
         elem.update_value(|val| {
             if let Some(items) = val.items_mut() {
                 for item in items.iter_mut() {
-                    remove_private_tags(item);
+                    remove_private_dataset_tags(item);
                 }
             }
         });
@@ -314,6 +505,25 @@ fn resolve_value(
     obj: &InMemDicomObject,
     tag: Tag,
 ) -> Result<String, DeidError> {
+    let current = obj
+        .element(tag)
+        .ok()
+        .and_then(|e| e.value().to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    resolve_value_from(value, variables, functions, &current)
+}
+
+/// Resolve an action value given the target attribute's current value directly.
+///
+/// The file meta group is not element-addressable, so its actions supply the
+/// current value here rather than having it looked up in a data set.
+fn resolve_value_from(
+    value: &Option<ActionValue>,
+    variables: &HashMap<String, String>,
+    functions: &HashMap<String, DeidFunction>,
+    current: &str,
+) -> Result<String, DeidError> {
     match value {
         Some(ActionValue::Literal(s)) => Ok(s.clone()),
         Some(ActionValue::Variable(name)) => variables
@@ -324,13 +534,7 @@ fn resolve_value(
             let func = functions
                 .get(name)
                 .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
-            let current = obj
-                .element(tag)
-                .ok()
-                .and_then(|e| e.value().to_str().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            func(&current)
+            func(current)
         }
         None => Ok(String::new()),
     }
@@ -491,12 +695,50 @@ fn cid_7050_meaning(code: &str) -> &'static str {
 ///
 /// Exempt tags/groups:
 /// - SOPClassUID (0008,0016), SOPInstanceUID (0008,0018),
-///   StudyInstanceUID (0020,000d), TransferSyntaxUID (0002,0010)
+///   StudyInstanceUID (0020,000d)
 /// - Group 0x0028 (pixel description parameters)
 /// - Group 0x7FE0 (pixel data — PixelData, FloatPixelData, DoublePixelData)
 /// - Groups listed in `recipe.keep_groups`
 /// - Overlay groups (0x6000-0x601e) when the recipe does not REMOVE them
-pub fn remove_unspecified_elements(obj: &mut InMemDicomObject, recipe: &Recipe) {
+///
+/// In the File Meta Information group, only the optional attributes are eligible
+/// for removal; the Type-1 attributes and the structural attributes in
+/// [`file_meta::PROTECTED_TAGS`] are always retained, since a file without them
+/// cannot be read back.
+pub fn remove_unspecified_elements(obj: &mut FileDicomObject<InMemDicomObject>, recipe: &Recipe) {
+    remove_unspecified_file_meta(obj, recipe);
+    remove_unspecified_dataset_elements(obj, recipe);
+}
+
+/// Remove optional File Meta Information attributes not named by any recipe action.
+fn remove_unspecified_file_meta(obj: &mut FileDicomObject<InMemDicomObject>, recipe: &Recipe) {
+    let mut targeted: HashSet<Tag> = HashSet::new();
+    for action in &recipe.header {
+        if let Ok(tags) = resolve_tags_in_file_meta(&action.tag, obj.meta()) {
+            targeted.extend(tags);
+        }
+    }
+
+    let removable: Vec<Tag> = file_meta::present_tags(obj.meta())
+        .into_iter()
+        .filter(|tag| {
+            !targeted.contains(tag)
+                && !file_meta::is_protected(*tag)
+                && !file_meta::is_required(*tag)
+        })
+        .collect();
+
+    if removable.is_empty() {
+        return;
+    }
+    obj.update_meta(|meta| {
+        for tag in removable {
+            file_meta::remove(meta, tag);
+        }
+    });
+}
+
+fn remove_unspecified_dataset_elements(obj: &mut InMemDicomObject, recipe: &Recipe) {
     // 1. Collect all tags targeted by any HeaderAction
     let mut targeted_tags: HashSet<Tag> = HashSet::new();
     for action in &recipe.header {
@@ -511,7 +753,6 @@ pub fn remove_unspecified_elements(obj: &mut InMemDicomObject, recipe: &Recipe) 
     targeted_tags.insert(Tag(0x0008, 0x0016)); // SOPClassUID
     targeted_tags.insert(Tag(0x0008, 0x0018)); // SOPInstanceUID
     targeted_tags.insert(Tag(0x0020, 0x000d)); // StudyInstanceUID
-    targeted_tags.insert(Tag(0x0002, 0x0010)); // TransferSyntaxUID
 
     // 3. Collect exempt groups
     let mut exempt_groups: HashSet<u16> = HashSet::new();
@@ -586,7 +827,7 @@ mod tests {
     /// Requirement r-3-1
     #[test]
     fn r3_1_add_new_tag() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![HeaderAction {
             action_type: ActionType::Add,
@@ -608,7 +849,7 @@ mod tests {
     /// Requirement r-3-1
     #[test]
     fn r3_1_add_does_not_overwrite_existing() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![HeaderAction {
@@ -636,7 +877,7 @@ mod tests {
     /// Requirement r-3-2
     #[test]
     fn r3_2_replace_existing_tag() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL_ID");
 
         let actions = vec![HeaderAction {
@@ -661,7 +902,7 @@ mod tests {
     /// Requirement r-3-3
     #[test]
     fn r3_3_delete_tag() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::OPERATORS_NAME, VR::PN, "Dr. Smith");
 
         let actions = vec![HeaderAction {
@@ -685,7 +926,7 @@ mod tests {
     /// Requirement r-3-6
     #[test]
     fn r3_6_function_reference_applied() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(
             &mut obj,
             tags::SOP_INSTANCE_UID,
@@ -722,7 +963,7 @@ mod tests {
     /// Requirement r-3-6
     #[test]
     fn r3_6_unknown_function_returns_error() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.3.4");
 
         let actions = vec![HeaderAction {
@@ -744,7 +985,7 @@ mod tests {
     /// Requirement r-3-7
     #[test]
     fn r3_7_jitter_date_within_month() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![HeaderAction {
@@ -767,7 +1008,7 @@ mod tests {
     /// Requirement r-3-7
     #[test]
     fn r3_7_jitter_date_across_month_boundary() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200130");
 
         let actions = vec![HeaderAction {
@@ -790,7 +1031,7 @@ mod tests {
     /// Requirement r-3-7
     #[test]
     fn r3_7_jitter_negative_days() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200105");
 
         let actions = vec![HeaderAction {
@@ -815,7 +1056,7 @@ mod tests {
     /// Requirement r-3-8
     #[test]
     fn r3_8_variable_reference_resolved() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let mut vars = HashMap::new();
@@ -840,7 +1081,7 @@ mod tests {
     /// Requirement r-3-8
     #[test]
     fn r3_8_missing_variable_returns_error() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![HeaderAction {
@@ -862,7 +1103,7 @@ mod tests {
     /// Requirement r-3-9
     #[test]
     fn r3_9_blank_tag_clears_value_but_keeps_tag() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![HeaderAction {
@@ -887,7 +1128,7 @@ mod tests {
     /// Requirement r-3-10
     #[test]
     fn r3_10_keep_preserves_original_value() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         // Both a KEEP and a REMOVE targeting the same field
@@ -921,7 +1162,7 @@ mod tests {
     /// Requirement r-3-11: KEEP > REMOVE
     #[test]
     fn r3_11_keep_beats_remove() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "12345");
 
         let actions = vec![
@@ -952,7 +1193,7 @@ mod tests {
     /// Requirement r-3-11: ADD > REPLACE
     #[test]
     fn r3_11_add_beats_replace() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![
             HeaderAction {
@@ -986,7 +1227,7 @@ mod tests {
     /// Requirement r-3-11: REPLACE > JITTER
     #[test]
     fn r3_11_replace_beats_jitter() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1021,7 +1262,7 @@ mod tests {
     /// Requirement r-3-11: JITTER > REMOVE
     #[test]
     fn r3_11_jitter_beats_remove() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1052,7 +1293,7 @@ mod tests {
     /// Requirement r-3-11: REMOVE > BLANK
     #[test]
     fn r3_11_remove_beats_blank() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![
@@ -1094,7 +1335,7 @@ mod tests {
     /// Requirement r-3-12
     #[test]
     fn r3_12_remove_all_private_tags() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         // Standard tags
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "12345");
@@ -1134,7 +1375,7 @@ mod tests {
     /// Requirement r-3-12
     #[test]
     fn r3_12_remove_private_tags_preserves_even_groups() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, Tag(0x0008, 0x0060), VR::CS, "CT"); // Modality (even group)
         put_str(&mut obj, Tag(0x0010, 0x0020), VR::LO, "ID"); // PatientID (even group)
 
@@ -1161,7 +1402,7 @@ mod tests {
 
     #[test]
     fn interaction_keep_beats_add() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![
@@ -1193,7 +1434,7 @@ mod tests {
 
     #[test]
     fn interaction_keep_beats_jitter() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1225,7 +1466,7 @@ mod tests {
 
     #[test]
     fn interaction_keep_beats_blank() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![
@@ -1257,7 +1498,7 @@ mod tests {
 
     #[test]
     fn interaction_add_beats_jitter() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         // Tag not present — ADD will create it, JITTER would fail if it won
         let actions = vec![
             HeaderAction {
@@ -1288,7 +1529,7 @@ mod tests {
 
     #[test]
     fn interaction_add_beats_remove() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![
             HeaderAction {
@@ -1319,7 +1560,7 @@ mod tests {
 
     #[test]
     fn interaction_add_beats_blank() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![
             HeaderAction {
@@ -1350,7 +1591,7 @@ mod tests {
 
     #[test]
     fn interaction_replace_beats_remove() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![
@@ -1382,7 +1623,7 @@ mod tests {
 
     #[test]
     fn interaction_replace_beats_blank() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![
@@ -1414,7 +1655,7 @@ mod tests {
 
     #[test]
     fn interaction_jitter_beats_blank() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1446,7 +1687,7 @@ mod tests {
 
     #[test]
     fn interaction_duplicate_add_first_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         // PatientID not present, so ADD will create it
 
         let actions = vec![
@@ -1482,7 +1723,7 @@ mod tests {
 
     #[test]
     fn interaction_duplicate_replace_first_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ORIGINAL");
 
         let actions = vec![
@@ -1524,7 +1765,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_keep_one_field() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "12345");
@@ -1563,7 +1804,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_add_new_field() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
         let actions = vec![
@@ -1603,7 +1844,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_replace_one() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
@@ -1644,7 +1885,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_jitter_one() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
@@ -1685,7 +1926,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_keep_and_replace_keep_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
         put_str(&mut obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
 
@@ -1728,7 +1969,7 @@ mod tests {
 
     #[test]
     fn compound_remove_all_keep_and_jitter_keep_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1770,7 +2011,7 @@ mod tests {
 
     #[test]
     fn compound_blank_and_keep_preserves_original() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1812,7 +2053,7 @@ mod tests {
 
     #[test]
     fn compound_remove_and_replace_replace_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1844,7 +2085,7 @@ mod tests {
 
     #[test]
     fn compound_remove_and_jitter_jitter_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1876,7 +2117,7 @@ mod tests {
 
     #[test]
     fn compound_remove_and_keep_keep_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -1908,7 +2149,7 @@ mod tests {
 
     #[test]
     fn compound_add_and_remove_add_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![
             HeaderAction {
@@ -1940,7 +2181,7 @@ mod tests {
     #[test]
     fn compound_remove_and_add_add_wins() {
         // Same as above but reversed action order — precedence is order-independent
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
 
         let actions = vec![
             HeaderAction {
@@ -1975,7 +2216,7 @@ mod tests {
 
     #[test]
     fn compound_jitter_replace_replace_wins() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20200115");
 
         let actions = vec![
@@ -2011,7 +2252,7 @@ mod tests {
 
     #[test]
     fn jitter_datetime_preserves_time() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         // DT (DateTime) VR — DICOM format: YYYYMMDDHHMMSS.FFFFFF
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20230101011721.621000");
 
@@ -2040,7 +2281,7 @@ mod tests {
 
     #[test]
     fn jitter_empty_date_is_noop() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::STUDY_DATE, VR::DA, "");
 
         let actions = vec![HeaderAction {
@@ -2068,7 +2309,7 @@ mod tests {
 
     #[test]
     fn jitter_private_tag() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         let private_tag = Tag(0x0029, 0x1019);
         put_str(&mut obj, private_tag, VR::DA, "20230101");
 
@@ -2110,7 +2351,7 @@ mod tests {
         let mut item = create_test_obj();
         put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-ORIGINAL");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         let actions = vec![
@@ -2143,7 +2384,7 @@ mod tests {
         put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-123");
         put_str(&mut item, tags::MODALITY, VR::CS, "CT");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         let actions = vec![
@@ -2176,7 +2417,7 @@ mod tests {
         let mut item = create_test_obj();
         put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-123");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         let actions = vec![
@@ -2212,7 +2453,7 @@ mod tests {
         let mut item = create_test_obj();
         put_str(&mut item, tags::STUDY_DATE, VR::DA, "20200115");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         let actions = vec![
@@ -2247,7 +2488,7 @@ mod tests {
         let mut outer_item = create_test_obj();
         put_sequence(&mut outer_item, SEQ_TAG, vec![inner_item]);
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         // Use a different sequence tag for the outer level
         let outer_seq_tag = Tag(0x0008, 0x1200); // StudiesContainingOtherReferencedInstancesSequence
         put_sequence(&mut obj, outer_seq_tag, vec![outer_item]);
@@ -2283,7 +2524,7 @@ mod tests {
         let mut item = create_test_obj();
         put_str(&mut item, tags::ACCESSION_NUMBER, VR::SH, "ACC-KEEP");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         let actions = vec![
@@ -2325,7 +2566,7 @@ mod tests {
     /// with no pixel payload.
     #[test]
     fn remove_unspecified_elements_preserves_pixel_data() {
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_str(&mut obj, tags::PATIENT_ID, VR::LO, "ID");
         // Stand-in pixel payloads in group 0x7FE0.
         obj.put(dicom_object::mem::InMemElement::new(
@@ -2357,7 +2598,7 @@ mod tests {
         put_str(&mut item, Tag(0x0009, 0x0010), VR::LO, "PRIVATE CREATOR");
         put_str(&mut item, Tag(0x0009, 0x1001), VR::LO, "private data");
 
-        let mut obj = create_test_obj();
+        let mut obj = create_test_file_obj();
         put_sequence(&mut obj, SEQ_TAG, vec![item]);
 
         remove_private_tags(&mut obj);
@@ -2374,6 +2615,419 @@ mod tests {
         assert!(
             seq_items[0].element(Tag(0x0009, 0x1001)).is_err(),
             "private data should be removed from sequence"
+        );
+    }
+
+    // -- r-3-14: File Meta Information group (0002) ---------------------------
+
+    use crate::file_meta as fm;
+
+    fn hashuid_funcs() -> HashMap<String, DeidFunction> {
+        let mut funcs: HashMap<String, DeidFunction> = HashMap::new();
+        funcs.insert(
+            "hashuid".into(),
+            Box::new(|input: &str| Ok(format!("2.25.{}", input.len()))),
+        );
+        funcs
+    }
+
+    fn action(
+        action_type: ActionType,
+        tag: TagSpecifier,
+        value: Option<ActionValue>,
+    ) -> HeaderAction {
+        HeaderAction {
+            action_type,
+            tag,
+            value,
+            condition: None,
+        }
+    }
+
+    fn keyword(name: &str) -> TagSpecifier {
+        TagSpecifier::Keyword(name.into())
+    }
+
+    /// Requirement r-3-14
+    ///
+    /// Mirrors `test_replace_filemeta` in
+    /// `resources/deid/deid/tests/test_file_meta.py`.
+    #[test]
+    fn r3_14_replace_media_storage_sop_instance_uid() {
+        let mut obj = create_test_file_obj();
+
+        let actions = vec![action(
+            ActionType::Replace,
+            keyword("MediaStorageSOPInstanceUID"),
+            Some(ActionValue::Literal("1.2.3.4.5.4.3.2.1".into())),
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            "1.2.3.4.5.4.3.2.1"
+        );
+    }
+
+    /// Requirement r-3-14
+    ///
+    /// `func:` values must be computed from the *un-padded* current value, so a
+    /// hash of the file meta UID matches a hash of the same UID in the data set.
+    #[test]
+    fn r3_14_func_value_sees_unpadded_current_value() {
+        let mut obj = create_test_file_obj();
+        // Odd-length UID: FileMetaTableBuilder stores it NUL-padded.
+        obj.update_meta(|m| m.media_storage_sop_instance_uid = "1.2.840.9999999\0".to_string());
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "1.2.840.9999999");
+
+        let actions = vec![
+            action(
+                ActionType::Replace,
+                keyword("SOPInstanceUID"),
+                Some(ActionValue::Function {
+                    name: "hashuid".into(),
+                    args: vec![],
+                }),
+            ),
+            action(
+                ActionType::Replace,
+                keyword("MediaStorageSOPInstanceUID"),
+                Some(ActionValue::Function {
+                    name: "hashuid".into(),
+                    args: vec![],
+                }),
+            ),
+        ];
+        apply_header_actions(&actions, &empty_vars(), &hashuid_funcs(), &mut obj)
+            .expect("should succeed");
+
+        let dataset_uid = obj
+            .element(tags::SOP_INSTANCE_UID)
+            .expect("present")
+            .value()
+            .to_str()
+            .expect("readable")
+            .to_string();
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            dataset_uid.trim_end_matches('\0'),
+            "hashing padded and unpadded copies of the same UID must agree"
+        );
+    }
+
+    /// Requirement r-3-14-1
+    #[test]
+    fn r3_14_1_transfer_syntax_uid_is_protected() {
+        let mut obj = create_test_file_obj();
+
+        for action_type in [ActionType::Replace, ActionType::Remove, ActionType::Blank] {
+            let actions = vec![action(
+                action_type,
+                keyword("TransferSyntaxUID"),
+                Some(ActionValue::Literal("1.2.3.4.5.4.3.2.1".into())),
+            )];
+            apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+                .expect("should succeed");
+            assert_eq!(
+                obj.meta().transfer_syntax(),
+                "1.2.840.10008.1.2.1",
+                "TransferSyntaxUID must be protected from de-identification"
+            );
+        }
+    }
+
+    /// Requirement r-3-14-1
+    #[test]
+    fn r3_14_1_implementation_class_uid_is_protected() {
+        let mut obj = create_test_file_obj();
+
+        let actions = vec![action(
+            ActionType::Remove,
+            keyword("ImplementationClassUID"),
+            None,
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(obj.meta().implementation_class_uid(), "1.2.3.4");
+    }
+
+    /// Requirement r-3-14-4
+    #[test]
+    fn r3_14_4_remove_source_application_entity_title() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| m.source_application_entity_title = Some("SENDING_SITE".into()));
+
+        let actions = vec![action(
+            ActionType::Remove,
+            keyword("SourceApplicationEntityTitle"),
+            None,
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(obj.meta().source_application_entity_title, None);
+    }
+
+    /// Requirement r-3-14
+    ///
+    /// A group-0002 rule must never inject a group-0002 element into the main
+    /// data set — that would emit a second, wrongly-encoded meta group.
+    #[test]
+    fn r3_14_file_meta_action_does_not_write_into_dataset() {
+        let mut obj = create_test_file_obj();
+
+        let actions = vec![action(
+            ActionType::Replace,
+            TagSpecifier::TagValue(fm::MEDIA_STORAGE_SOP_INSTANCE_UID),
+            Some(ActionValue::Literal("1.2.3.4.5.4.3.2.1".into())),
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert!(
+            obj.element(fm::MEDIA_STORAGE_SOP_INSTANCE_UID).is_err(),
+            "group 0002 must not appear in the data set"
+        );
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            "1.2.3.4.5.4.3.2.1"
+        );
+    }
+
+    /// Requirement r-3-14 / r-3-5
+    #[test]
+    fn r3_14_pattern_specifier_reaches_file_meta() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| m.source_application_entity_title = Some("SENDING_SITE".into()));
+
+        let actions = vec![action(
+            ActionType::Remove,
+            TagSpecifier::Pattern("^SourceApplicationEntityTitle$".into()),
+            None,
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(obj.meta().source_application_entity_title, None);
+    }
+
+    /// Requirement r-3-14 / r-3-4-2
+    #[test]
+    fn r3_14_group_range_specifier_reaches_file_meta() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| {
+            m.source_application_entity_title = Some("SENDING_SITE".into());
+            m.sending_application_entity_title = Some("SENDER".into());
+        });
+
+        let actions = vec![action(
+            ActionType::Remove,
+            TagSpecifier::GroupRange {
+                group_min: 0x0002,
+                group_max: 0x0002,
+                element: None,
+            },
+            None,
+        )];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(obj.meta().source_application_entity_title, None);
+        assert_eq!(obj.meta().sending_application_entity_title, None);
+        // Wildcard removal must still not touch the structural attributes.
+        assert_eq!(obj.meta().transfer_syntax(), "1.2.840.10008.1.2.1");
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            "1.2.3.4.5.6.7.8.9"
+        );
+    }
+
+    /// Requirement r-3-11
+    #[test]
+    fn r3_11_precedence_applies_to_file_meta_tags() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| m.source_application_entity_title = Some("SENDING_SITE".into()));
+
+        // KEEP outranks REMOVE.
+        let actions = vec![
+            action(
+                ActionType::Remove,
+                keyword("SourceApplicationEntityTitle"),
+                None,
+            ),
+            action(
+                ActionType::Keep,
+                keyword("SourceApplicationEntityTitle"),
+                None,
+            ),
+        ];
+        apply_header_actions(&actions, &empty_vars(), &empty_funcs(), &mut obj)
+            .expect("should succeed");
+
+        assert_eq!(
+            fm::get(obj.meta(), fm::SOURCE_APPLICATION_ENTITY_TITLE).as_deref(),
+            Some("SENDING_SITE"),
+            "KEEP must outrank REMOVE for file meta tags too"
+        );
+    }
+
+    /// Requirement r-3-14-2
+    #[test]
+    fn r3_14_2_remove_private_tags_clears_file_meta_private_information() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| {
+            m.private_information_creator_uid = Some("1.2.3.4.5".into());
+            m.private_information = Some(vec![0xde, 0xad]);
+        });
+
+        remove_private_tags(&mut obj);
+
+        assert_eq!(obj.meta().private_information_creator_uid, None);
+        assert_eq!(obj.meta().private_information, None);
+    }
+
+    /// Requirement r-3-14-3
+    #[test]
+    fn r3_14_3_finalize_syncs_media_storage_uids_with_dataset() {
+        let mut obj = create_test_file_obj();
+        put_str(&mut obj, tags::SOP_INSTANCE_UID, VR::UI, "2.25.999");
+        put_str(
+            &mut obj,
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            "1.2.840.10008.5.1.4.1.1.4",
+        );
+
+        finalize_file_meta(&mut obj);
+
+        assert_eq!(obj.meta().media_storage_sop_instance_uid(), "2.25.999");
+        assert_eq!(
+            obj.meta().media_storage_sop_class_uid(),
+            "1.2.840.10008.5.1.4.1.1.4"
+        );
+
+        // Idempotent.
+        let before = obj.meta().clone();
+        finalize_file_meta(&mut obj);
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            before.media_storage_sop_instance_uid()
+        );
+        assert_eq!(
+            obj.meta().information_group_length,
+            before.information_group_length
+        );
+    }
+
+    /// Requirement r-3-14-3
+    ///
+    /// A recipe that only rewrites the data set UID must still produce a
+    /// self-consistent file — this is the PHI leak the pass exists to close.
+    #[test]
+    fn r3_14_3_dataset_only_uid_rule_still_syncs_file_meta() {
+        let mut obj = create_test_file_obj();
+        put_str(
+            &mut obj,
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            "1.2.3.4.5.6.7.8.9",
+        );
+
+        let actions = vec![action(
+            ActionType::Replace,
+            keyword("SOPInstanceUID"),
+            Some(ActionValue::Function {
+                name: "hashuid".into(),
+                args: vec![],
+            }),
+        )];
+        apply_header_actions(&actions, &empty_vars(), &hashuid_funcs(), &mut obj)
+            .expect("should succeed");
+        finalize_file_meta(&mut obj);
+
+        let dataset_uid = obj
+            .element(tags::SOP_INSTANCE_UID)
+            .expect("present")
+            .value()
+            .to_str()
+            .expect("readable")
+            .to_string();
+        assert_ne!(dataset_uid, "1.2.3.4.5.6.7.8.9", "UID should be hashed");
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            dataset_uid,
+            "the original SOP Instance UID must not survive in group 0002"
+        );
+    }
+
+    /// Requirement r-3-14-4
+    #[test]
+    fn r3_14_4_finalize_strips_identifying_meta_attributes() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| {
+            m.source_application_entity_title = Some("SENDING_SITE".into());
+            m.sending_application_entity_title = Some("SENDER".into());
+            m.receiving_application_entity_title = Some("RECEIVER".into());
+            m.private_information_creator_uid = Some("1.2.3.4.5".into());
+            m.private_information = Some(vec![0xde, 0xad]);
+        });
+
+        finalize_file_meta(&mut obj);
+
+        assert_eq!(obj.meta().source_application_entity_title, None);
+        assert_eq!(obj.meta().sending_application_entity_title, None);
+        assert_eq!(obj.meta().receiving_application_entity_title, None);
+        assert_eq!(obj.meta().private_information_creator_uid, None);
+        assert_eq!(obj.meta().private_information, None);
+        // Left alone: on the reference implementation's protected list.
+        assert_eq!(obj.meta().transfer_syntax(), "1.2.840.10008.1.2.1");
+        assert_eq!(obj.meta().implementation_class_uid(), "1.2.3.4");
+    }
+
+    /// Requirement r-3-14-1
+    #[test]
+    fn r3_14_1_remove_unspecified_keeps_structural_file_meta() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| {
+            m.source_application_entity_title = Some("SENDING_SITE".into());
+            m.implementation_version_name = Some("VENDOR_1_0".into());
+        });
+
+        let recipe = Recipe::parse("FORMAT dicom\n%header\nKEEP Modality\n").expect("should parse");
+        remove_unspecified_elements(&mut obj, &recipe);
+
+        // Optional, unnamed attributes go.
+        assert_eq!(obj.meta().source_application_entity_title, None);
+        assert_eq!(obj.meta().implementation_version_name, None);
+        // Structural attributes stay: the file must remain readable.
+        assert_eq!(obj.meta().transfer_syntax(), "1.2.840.10008.1.2.1");
+        assert_eq!(obj.meta().implementation_class_uid(), "1.2.3.4");
+        assert_eq!(
+            obj.meta().media_storage_sop_instance_uid(),
+            "1.2.3.4.5.6.7.8.9"
+        );
+        assert_eq!(
+            obj.meta().media_storage_sop_class_uid(),
+            "1.2.840.10008.5.1.4.1.1.2"
+        );
+    }
+
+    /// Requirement r-3-14-1
+    #[test]
+    fn r3_14_1_remove_unspecified_honours_named_file_meta_tags() {
+        let mut obj = create_test_file_obj();
+        obj.update_meta(|m| m.source_application_entity_title = Some("SENDING_SITE".into()));
+
+        let recipe = Recipe::parse("FORMAT dicom\n%header\nKEEP SourceApplicationEntityTitle\n")
+            .expect("should parse");
+        remove_unspecified_elements(&mut obj, &recipe);
+
+        assert_eq!(
+            fm::get(obj.meta(), fm::SOURCE_APPLICATION_ENTITY_TITLE).as_deref(),
+            Some("SENDING_SITE"),
+            "an attribute named by the recipe must not be swept away"
         );
     }
 }

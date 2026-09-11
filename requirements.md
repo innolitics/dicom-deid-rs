@@ -54,6 +54,11 @@ r-3-10 The software must support explicitly keeping a tag's original value uncha
 r-3-11 When multiple actions apply to the same field, the software must respect a precedence hierarchy: KEEP > ADD > REPLACE > JITTER > REMOVE > BLANK
 r-3-12 The software must support bulk removal of private tags from DICOM files
 r-3-13 All metadata de-identification actions (ADD, REPLACE, REMOVE, BLANK, KEEP, JITTER) and private tag removal must apply recursively to elements nested within DICOM sequences (VR=SQ) at any depth.
+r-3-14 Metadata de-identification actions must apply to File Meta Information (group 0002) attributes as well as to the main data set, addressable by keyword, tag value, and pattern. Actions targeting group 0002 must modify the file meta group and must not insert group 0002 elements into the main data set.
+r-3-14-1 The following File Meta Information attributes must be protected from modification and removal: FileMetaInformationGroupLength (0002,0000), FileMetaInformationVersion (0002,0001), TransferSyntaxUID (0002,0010), and ImplementationClassUID (0002,0012). Removal of unspecified elements must additionally retain the Type-1 attributes MediaStorageSOPClassUID (0002,0002) and MediaStorageSOPInstanceUID (0002,0003).
+r-3-14-2 Private tag removal must also clear PrivateInformationCreatorUID (0002,0100) and PrivateInformation (0002,0102).
+r-3-14-3 On write, MediaStorageSOPClassUID (0002,0002) and MediaStorageSOPInstanceUID (0002,0003) must equal the de-identified data set's SOPClassUID (0008,0016) and SOPInstanceUID (0008,0018), regardless of whether the recipe names them.
+r-3-14-4 SourceApplicationEntityTitle (0002,0016), SendingApplicationEntityTitle (0002,0017), and ReceivingApplicationEntityTitle (0002,0018) must be removed during de-identification.
 
 r-4 Pixel-based De-identification
 r-4-1 The software must support pixel-based de-identification by masking over pixel areas

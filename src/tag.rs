@@ -1,10 +1,12 @@
 use crate::error::DeidError;
+use crate::file_meta;
 use crate::recipe::TagSpecifier;
 use dicom_core::Tag;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_core::header::Header;
 use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::InMemDicomObject;
+use dicom_object::meta::FileMetaTable;
 use regex::Regex;
 
 /// Parse a tag string in parenthesized format "(GGGG,EEEE)" into a `Tag`.
@@ -38,57 +40,72 @@ pub fn parse_bare_hex_tag(s: &str) -> Result<Tag, DeidError> {
     Ok(Tag(group, element))
 }
 
+/// Resolve a keyword to its tag via the standard data dictionary.
+fn resolve_keyword(name: &str) -> Result<Tag, DeidError> {
+    StandardDataDictionary
+        .by_name(name)
+        .map(|entry| entry.tag())
+        .ok_or_else(|| DeidError::TagResolution(format!("unknown keyword: {}", name)))
+}
+
+/// Whether `tag` matches a compiled tag pattern, by dictionary keyword or by
+/// its `(gggg,eeee)` textual form.
+fn pattern_matches(re: &Regex, tag: Tag) -> bool {
+    let tag_str = format!("({:04x},{:04x})", tag.0, tag.1);
+    let keyword = StandardDataDictionary
+        .by_tag(tag)
+        .map(|e| e.alias().to_string())
+        .unwrap_or_default();
+    re.is_match(&keyword) || re.is_match(&tag_str)
+}
+
+/// Whether `tag` falls within an inclusive group range, optionally restricted to
+/// a single element number.
+fn group_range_matches(tag: Tag, group_min: u16, group_max: u16, element: Option<u16>) -> bool {
+    if tag.group() < group_min || tag.group() > group_max {
+        return false;
+    }
+    match element {
+        Some(e) => tag.element() == e,
+        None => true,
+    }
+}
+
+fn compile_pattern(pattern: &str) -> Result<Regex, DeidError> {
+    Regex::new(pattern).map_err(|e| DeidError::TagResolution(format!("invalid regex: {}", e)))
+}
+
 /// Resolve a `TagSpecifier` into one or more concrete `Tag` values.
 ///
 /// For pattern-based specifiers, the object is inspected to find all matching
 /// tags. For keyword and direct tag specifiers, the result is a single tag.
+///
+/// This searches the main data set only. Use [`resolve_tags_in_file_meta`] to
+/// resolve against the File Meta Information group.
 pub fn resolve_tags(
     specifier: &TagSpecifier,
     obj: &InMemDicomObject,
 ) -> Result<Vec<Tag>, DeidError> {
-    let dict = StandardDataDictionary;
     match specifier {
-        TagSpecifier::Keyword(name) => {
-            let entry = dict
-                .by_name(name)
-                .ok_or_else(|| DeidError::TagResolution(format!("unknown keyword: {}", name)))?;
-            Ok(vec![entry.tag()])
-        }
+        TagSpecifier::Keyword(name) => Ok(vec![resolve_keyword(name)?]),
         TagSpecifier::TagValue(tag) => Ok(vec![*tag]),
         TagSpecifier::Pattern(pattern) => {
-            let re = Regex::new(pattern)
-                .map_err(|e| DeidError::TagResolution(format!("invalid regex: {}", e)))?;
-            let mut matched = Vec::new();
-            for elem in obj.iter() {
-                let tag = elem.tag();
-                let tag_str = format!("({:04x},{:04x})", tag.0, tag.1);
-                let keyword = dict
-                    .by_tag(tag)
-                    .map(|e| e.alias().to_string())
-                    .unwrap_or_default();
-                if re.is_match(&keyword) || re.is_match(&tag_str) {
-                    matched.push(tag);
-                }
-            }
-            Ok(matched)
+            let re = compile_pattern(pattern)?;
+            Ok(obj
+                .iter()
+                .map(|elem| elem.tag())
+                .filter(|tag| pattern_matches(&re, *tag))
+                .collect())
         }
         TagSpecifier::GroupRange {
             group_min,
             group_max,
             element,
-        } => {
-            let mut matched = Vec::new();
-            for elem in obj.iter() {
-                let tag = elem.tag();
-                if tag.group() >= *group_min && tag.group() <= *group_max {
-                    match element {
-                        Some(e) if tag.element() != *e => continue,
-                        _ => matched.push(tag),
-                    }
-                }
-            }
-            Ok(matched)
-        }
+        } => Ok(obj
+            .iter()
+            .map(|elem| elem.tag())
+            .filter(|tag| group_range_matches(*tag, *group_min, *group_max, *element))
+            .collect()),
         TagSpecifier::PrivateTag {
             group,
             creator,
@@ -113,6 +130,44 @@ pub fn resolve_tags(
                 creator, group
             )))
         }
+    }
+}
+
+/// Resolve a `TagSpecifier` against the File Meta Information group (0002).
+///
+/// This is the file meta counterpart of [`resolve_tags`]. Pattern and group-range
+/// specifiers match against the attributes actually present in `meta`
+/// (`file_meta::present_tags`) rather than the main data set, which is what lets
+/// a rule such as `REPLACE .*UID func:hashuid` reach `(0002,0003)`.
+///
+/// Callers are expected to discard any resolved tag outside group 0002; keyword
+/// and tag-value specifiers are returned verbatim, exactly as `resolve_tags` does.
+///
+/// Group 0002 is an even (public) group, so private-creator specifiers can never
+/// match and resolve to an empty set rather than an error.
+pub fn resolve_tags_in_file_meta(
+    specifier: &TagSpecifier,
+    meta: &FileMetaTable,
+) -> Result<Vec<Tag>, DeidError> {
+    match specifier {
+        TagSpecifier::Keyword(name) => Ok(vec![resolve_keyword(name)?]),
+        TagSpecifier::TagValue(tag) => Ok(vec![*tag]),
+        TagSpecifier::Pattern(pattern) => {
+            let re = compile_pattern(pattern)?;
+            Ok(file_meta::present_tags(meta)
+                .into_iter()
+                .filter(|tag| pattern_matches(&re, *tag))
+                .collect())
+        }
+        TagSpecifier::GroupRange {
+            group_min,
+            group_max,
+            element,
+        } => Ok(file_meta::present_tags(meta)
+            .into_iter()
+            .filter(|tag| group_range_matches(*tag, *group_min, *group_max, *element))
+            .collect()),
+        TagSpecifier::PrivateTag { .. } => Ok(Vec::new()),
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod ctp;
 pub mod error;
+pub mod file_meta;
 pub mod filter;
 pub mod filter_index;
 pub mod functions;
