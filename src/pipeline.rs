@@ -110,13 +110,19 @@ fn extract_tags(obj: &InMemDicomObject, tag_names: &[&str]) -> TagSnapshot {
 }
 
 /// Build output path from de-identified DICOM tags, matching CTP's structure:
-///   `DATE-{StudyDate}--{Modality}--PID-{PatientID}--{StudyUIDHash}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm`
+///   `DATE-{StudyDate}--PID-{PatientID}--{StudyUIDHash}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm`
 ///
 /// The study folder includes a short StudyInstanceUID hash so that distinct
-/// studies sharing a patient, date, and modality (e.g. a Brain and a Spine MR on
-/// the same day) do not collapse into one folder. Collapsing into a single folder
-/// caused issues when series numbers were re-used across studies, leading to
-/// problems in the image viewer where series weren't properly distinguished.
+/// studies sharing a patient and date (e.g. a Brain and a Spine MR on the same
+/// day) do not collapse into one folder. Collapsing into a single folder caused
+/// issues when series numbers were re-used across studies, leading to problems in
+/// the image viewer where series weren't properly distinguished.
+///
+/// Every component of the study folder is study- or patient-level, so all
+/// instances of one study group into exactly one folder (r-1-4). Modality is
+/// deliberately absent: it is a *series*-level attribute, and including it split
+/// multi-modality studies (a PET/CT, or a study carrying a structured report)
+/// across two folders despite their sharing a StudyInstanceUID.
 fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     let dict = dicom_dictionary_std::StandardDataDictionary;
 
@@ -129,7 +135,6 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     };
 
     let study_date = get("StudyDate");
-    let modality = get("Modality");
     let patient_id = get("PatientID");
     let study_instance_uid = get("StudyInstanceUID");
     let series_number = get("SeriesNumber");
@@ -139,11 +144,6 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
         "UNKNOWN".to_string()
     } else {
         study_date
-    };
-    let modality_part = if modality.is_empty() {
-        "UN".to_string()
-    } else {
-        modality
     };
     let pid_part = if patient_id.is_empty() {
         "UNKNOWN".to_string()
@@ -164,7 +164,7 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     };
 
     let study_dir = if study_instance_uid.is_empty() {
-        format!("DATE-{}--{}--PID-{}", date_part, modality_part, pid_part)
+        format!("DATE-{}--PID-{}", date_part, pid_part)
     } else {
         let digest = Sha256::digest(study_instance_uid.as_bytes());
         let short: String = digest
@@ -172,10 +172,7 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
             .take(4)
             .map(|b| format!("{:02x}", b))
             .collect();
-        format!(
-            "DATE-{}--{}--PID-{}--{}",
-            date_part, modality_part, pid_part, short
-        )
+        format!("DATE-{}--PID-{}--{}", date_part, pid_part, short)
     };
     output_dir.join(study_dir).join(ser_part).join(file_name)
 }
@@ -929,7 +926,7 @@ mod tests {
 
         // Verify output file exists at CTP-style path
         let output_file = output_dir
-            .join("DATE-20250101--CT--PID-PID001")
+            .join("DATE-20250101--PID-PID001")
             .join("SER-00001")
             .join("1.2.3.4.5.6.7.8.9.dcm");
         assert!(
@@ -987,6 +984,39 @@ mod tests {
     }
 
     // -- r-1-3 (parallel) ----------------------------------------------------
+
+    /// Immediate subdirectories of `dir`, sorted by name.
+    #[cfg(test)]
+    fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// Count every .dcm file anywhere under `dir`.
+    #[cfg(test)]
+    fn count_dicom_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| {
+                        let path = e.path();
+                        if path.is_dir() {
+                            count_dicom_files(&path)
+                        } else {
+                            usize::from(path.extension().is_some_and(|x| x == "dcm"))
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
 
     /// Every de-identified file produced under `output_dir`, as
     /// (path relative to `output_dir`, PatientName), sorted for comparison.
@@ -1320,6 +1350,148 @@ mod tests {
         }
     }
 
+    /// Requirement r-1-4
+    ///
+    /// Every instance of one study must land in a single study directory,
+    /// regardless of which input subdirectory it arrived in or which series it
+    /// belongs to. Input nesting is deliberately not preserved — files are
+    /// regrouped by study.
+    #[test]
+    fn r1_4_one_study_groups_into_one_directory() {
+        use crate::test_helpers::*;
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        let nested = input_dir.join("a").join("b");
+        fs::create_dir_all(&nested).expect("create nested input dirs");
+
+        // One study, two series, instances scattered across three input depths.
+        let dirs = [input_dir.clone(), input_dir.join("a"), nested.clone()];
+        for (idx, dir) in dirs.iter().enumerate() {
+            for series in 0..2 {
+                let mut obj = create_test_file_obj();
+                put_str(
+                    &mut obj,
+                    tags::SOP_INSTANCE_UID,
+                    VR::UI,
+                    &format!("9.9.{idx}.{series}"),
+                );
+                put_str(&mut obj, tags::STUDY_INSTANCE_UID, VR::UI, "1.2.100");
+                put_str(
+                    &mut obj,
+                    tags::SERIES_INSTANCE_UID,
+                    VR::UI,
+                    &format!("1.2.100.{series}"),
+                );
+                put_str(&mut obj, tags::SERIES_NUMBER, VR::IS, &format!("{series}"));
+                put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20240402");
+                put_str(&mut obj, tags::MODALITY, VR::CS, "CT");
+                put_str(&mut obj, tags::PATIENT_ID, VR::LO, "PID1");
+                obj.write_to_file(dir.join(format!("f{idx}{series}.dcm")))
+                    .expect("write test DICOM");
+            }
+        }
+
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path: tmp.path().join("unused.txt"),
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: false,
+            remove_unspecified_elements: false,
+            quarantine_dir: None,
+        };
+        DeidPipeline::from_recipe_text("FORMAT dicom\n%header\n", config)
+            .expect("create pipeline")
+            .run()
+            .expect("run pipeline");
+
+        let study_dirs = subdirectories(&output_dir);
+        assert_eq!(
+            study_dirs.len(),
+            1,
+            "all 6 instances share one study and must group into one directory, got {study_dirs:?}"
+        );
+        assert_eq!(
+            subdirectories(&study_dirs[0]).len(),
+            2,
+            "the study directory holds one folder per series"
+        );
+        assert_eq!(
+            count_dicom_files(&output_dir),
+            6,
+            "no instance may be lost or overwritten"
+        );
+    }
+
+    /// Requirement r-1-4
+    ///
+    /// Modality (0008,0060) is a *series*-level attribute, so a single study may
+    /// contain series of different modalities (a PET/CT, or a CT study carrying a
+    /// structured report). Those instances still belong to one study and must be
+    /// grouped together.
+    #[test]
+    fn r1_4_multi_modality_study_groups_into_one_directory() {
+        use crate::test_helpers::*;
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        // One PET/CT study: a PT series and a CT series.
+        for (idx, modality) in ["PT", "CT"].iter().enumerate() {
+            let mut obj = create_test_file_obj();
+            put_str(
+                &mut obj,
+                tags::SOP_INSTANCE_UID,
+                VR::UI,
+                &format!("9.9.{idx}"),
+            );
+            put_str(&mut obj, tags::STUDY_INSTANCE_UID, VR::UI, "1.2.100");
+            put_str(
+                &mut obj,
+                tags::SERIES_INSTANCE_UID,
+                VR::UI,
+                &format!("1.2.100.{idx}"),
+            );
+            put_str(&mut obj, tags::SERIES_NUMBER, VR::IS, &format!("{idx}"));
+            put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20240402");
+            put_str(&mut obj, tags::MODALITY, VR::CS, modality);
+            put_str(&mut obj, tags::PATIENT_ID, VR::LO, "PID1");
+            obj.write_to_file(input_dir.join(format!("f{idx}.dcm")))
+                .expect("write test DICOM");
+        }
+
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path: tmp.path().join("unused.txt"),
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: false,
+            remove_unspecified_elements: false,
+            quarantine_dir: None,
+        };
+        DeidPipeline::from_recipe_text("FORMAT dicom\n%header\n", config)
+            .expect("create pipeline")
+            .run()
+            .expect("run pipeline");
+
+        let study_dirs = subdirectories(&output_dir);
+        assert_eq!(
+            study_dirs.len(),
+            1,
+            "one study must produce one directory even across modalities, got {study_dirs:?}"
+        );
+    }
+
     /// from_recipe_text avoids needing a recipe file on disk
     #[test]
     fn from_recipe_text_works() {
@@ -1391,7 +1563,7 @@ mod tests {
         assert_eq!(report.files_processed, 1);
 
         let output_file = output_dir
-            .join("DATE-20250101--CT--PID-PID001")
+            .join("DATE-20250101--PID-PID001")
             .join("SER-00001")
             .join("1.2.3.4.5.6.7.8.9.dcm");
         let result_obj = open_file(&output_file).expect("should open output");

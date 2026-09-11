@@ -252,14 +252,14 @@ REPLACE PatientName ANON
 
     // CT file should exist in output at CTP-style path
     let ct_output = output_dir
-        .join("DATE-20250101--CT--PID-PID001")
+        .join("DATE-20250101--PID-PID001")
         .join("SER-00001")
         .join("1.2.3.4.5.6.7.8.9.dcm");
     assert!(ct_output.exists(), "CT output file should exist");
 
     // SR file should NOT exist in output (blacklisted)
     assert!(
-        !output_dir.join("DATE-20250101--SR--PID-PID002").exists(),
+        !output_dir.join("DATE-20250101--PID-PID002").exists(),
         "SR output directory should not exist"
     );
 
@@ -336,7 +336,7 @@ fn pipeline_multiple_files_nested_dirs() {
     assert_eq!(report.files_processed, 3, "all 3 files should be processed");
 
     // Verify output uses CTP-style directory structure
-    let study_dir = output_dir.join("DATE-20250101--CT--PID-PID001");
+    let study_dir = output_dir.join("DATE-20250101--PID-PID001");
     assert!(study_dir.exists(), "study directory should exist");
     assert!(
         study_dir
@@ -490,7 +490,7 @@ REPLACE PatientName ANON
     assert_eq!(report.files_processed, 1);
 
     let output_file = output_dir
-        .join("DATE-20250101--CT--PID-PID001")
+        .join("DATE-20250101--PID-PID001")
         .join("SER-00001")
         .join("1.2.3.4.5.6.7.8.9.dcm");
     assert!(output_file.exists(), "output file should exist");

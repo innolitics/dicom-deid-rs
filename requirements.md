@@ -2,7 +2,7 @@ r-1 Inputs and Outputs
 r-1-1 The software must accept a path to a directory of DICOM files as an input, a path to the output directory, and a path to the recipe file.
 r-1-2 The software must recursively search the input directory for all DICOM files
 r-1-3 The software must display a progress bar on the console as it processes input files
-r-1-4 The software must preserve the relative directory structure of input files in the output directory (e.g., input/sub/file.dcm → output/sub/file.dcm)
+r-1-4 The software must group output files in directories by study
 r-1-5 The software must continue processing remaining files when an individual file fails, logging a warning and counting the file as skipped in the final report
 
 r-2 De-id Recipe Specification
