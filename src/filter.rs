@@ -1,26 +1,79 @@
 use crate::recipe::{
     Condition, CoordinateRegion, FilterLabel, FilterType, LogicalOp, Predicate, Recipe,
 };
+use crate::tag::{parse_bare_hex_tag, parse_parenthesized_tag};
+use dicom_core::Tag;
 use dicom_core::value::PrimitiveValue;
 use dicom_object::InMemDicomObject;
 use regex::Regex;
 
+/// Parse a field identifier as a DICOM tag if it looks like one.
+///
+/// Accepts the three formats the filter translator may emit:
+/// - `00081090`          (bare 8-hex-digit)
+/// - `0008,1090`         (comma-separated)
+/// - `(0008,1090)`       (parenthesized)
+///
+/// Returns `None` for keyword-style field names (which are resolved via
+/// `obj.element_by_name`).
+fn field_as_tag(field: &str) -> Option<Tag> {
+    if field.starts_with('(') {
+        return parse_parenthesized_tag(field).ok();
+    }
+    if let Some((g, e)) = field.split_once(',')
+        && let (Ok(group), Ok(element)) = (
+            u16::from_str_radix(g.trim(), 16),
+            u16::from_str_radix(e.trim(), 16),
+        )
+    {
+        return Some(Tag(group, element));
+    }
+    parse_bare_hex_tag(field).ok()
+}
+
+/// Look up a DICOM element by keyword, falling back to a hex-tag lookup when
+/// the field is a bare `GGGGEEEE` / `GGGG,EEEE` / `(GGGG,EEEE)` tag literal.
+///
+/// The CTP filter translator emits hex tag IDs (e.g. `00081090`) for any
+/// `[GGGG,EEEE]` reference in the source script; those have no DICOM keyword,
+/// so `element_by_name` alone would never resolve them.
+fn resolve_element<'a>(
+    obj: &'a InMemDicomObject,
+    field: &str,
+) -> Option<&'a dicom_object::mem::InMemElement<dicom_dictionary_std::StandardDataDictionary>> {
+    if let Ok(elem) = obj.element_by_name(field) {
+        return Some(elem);
+    }
+    if let Some(tag) = field_as_tag(field) {
+        return obj.element(tag).ok();
+    }
+    None
+}
+
 /// Resolve a DICOM field value as a string, returning None if the field is missing.
 pub fn get_field_string(obj: &InMemDicomObject, field: &str) -> Option<String> {
-    obj.element_by_name(field)
-        .ok()
-        .and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
+    resolve_element(obj, field).and_then(|elem| elem.value().to_str().ok().map(|s| s.to_string()))
+}
+
+/// Return `true` when the field resolves to an element in the object.
+pub fn field_present(obj: &InMemDicomObject, field: &str) -> bool {
+    resolve_element(obj, field).is_some()
 }
 
 /// Evaluate a single filter predicate against a DICOM object.
 ///
 /// Field names in predicates are resolved to DICOM tags by keyword lookup.
 pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool {
+    // Value-comparison predicates (contains/equals/startswith and negations)
+    // treat a MISSING field as the empty string, matching CTP's DicomFilter:
+    // in CTP `Tag.equals("")` is true when the tag is absent. This is what lets
+    // `!ConversionType.equals("")` / `ImageType.equals("")` style gauntlet rules
+    // round-trip correctly through translate-ctp's DNF expansion (which turns
+    // them into positive `equals X ""` conditions). The `missing`/`empty`/
+    // `present` predicates below keep their distinct present-vs-absent meaning.
     match predicate {
         Predicate::Contains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => re.is_match(&field_val),
@@ -28,9 +81,7 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::NotContains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => !re.is_match(&field_val),
@@ -38,30 +89,58 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::Equals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() == value.to_lowercase()
         }
         Predicate::NotEquals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() != value.to_lowercase()
         }
-        Predicate::Missing { field } => obj.element_by_name(field).is_err(),
-        Predicate::Empty { field } => match obj.element_by_name(field) {
-            Ok(elem) => match elem.value() {
+        Predicate::StartsWith { field, value } => {
+            let field_val = get_field_string(obj, field).unwrap_or_default();
+            field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::NotStartsWith { field, value } => {
+            let field_val = get_field_string(obj, field).unwrap_or_default();
+            !field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::Missing { field } => !field_present(obj, field),
+        Predicate::Empty { field } => match resolve_element(obj, field) {
+            Some(elem) => match elem.value() {
                 dicom_core::value::Value::Primitive(prim) => match prim {
                     PrimitiveValue::Empty => true,
                     _ => elem.value().to_str().map(|s| s.is_empty()).unwrap_or(true),
                 },
                 _ => false,
             },
-            Err(_) => false,
+            None => false,
         },
-        Predicate::Present { field } => obj.element_by_name(field).is_ok(),
+        Predicate::GreaterThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a > b,
+                _ => false,
+            }
+        }
+        Predicate::LessThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a < b,
+                _ => false,
+            }
+        }
+        Predicate::Present { field } => field_present(obj, field),
     }
+}
+
+/// Resolve a DICOM field to a number for numeric comparisons.
+///
+/// DICOM numeric strings (DS/IS) may be multi-valued (backslash-separated);
+/// only the first value is used. Returns `None` when the field is missing or
+/// the value does not parse as a number, so numeric predicates are `false`
+/// for absent/non-numeric fields (matching CTP's `isGreaterThan`/`isLessThan`).
+pub(crate) fn numeric_field(obj: &InMemDicomObject, field: &str) -> Option<f64> {
+    let raw = get_field_string(obj, field)?;
+    let first = raw.split('\\').next().unwrap_or("").trim();
+    first.parse::<f64>().ok()
 }
 
 /// Evaluate a list of conditions with logical operators against a DICOM object.
@@ -103,6 +182,7 @@ pub fn is_blacklisted(recipe: &Recipe, obj: &InMemDicomObject) -> bool {
 /// Return the name of the first matching blacklist label, or `None` if no
 /// blacklist filter matches.
 pub fn blacklist_reason<'a>(recipe: &'a Recipe, obj: &InMemDicomObject) -> Option<&'a str> {
+    // Check explicit blacklist sections
     for section in &recipe.filters {
         if section.filter_type != FilterType::Blacklist {
             continue;
@@ -113,6 +193,22 @@ pub fn blacklist_reason<'a>(recipe: &'a Recipe, obj: &InMemDicomObject) -> Optio
             }
         }
     }
+
+    // Check whitelist sections: file must match at least one whitelist label
+    let has_whitelist = recipe
+        .filters
+        .iter()
+        .any(|s| s.filter_type == FilterType::Whitelist);
+    if has_whitelist {
+        let matches_any_whitelist = recipe.filters.iter().any(|section| {
+            section.filter_type == FilterType::Whitelist
+                && section.labels.iter().any(|label| matches_label(label, obj))
+        });
+        if !matches_any_whitelist {
+            return Some("whitelist_rejected");
+        }
+    }
+
     None
 }
 
@@ -273,6 +369,103 @@ mod tests {
         assert!(
             !evaluate_predicate(&pred, &obj),
             "notequals should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn greaterthan_and_lessthan_compare_numeric_values() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SLICE_THICKNESS, VR::DS, "3.0");
+
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        let lt = Predicate::LessThan {
+            field: "SliceThickness".into(),
+            value: "5".into(),
+        };
+        assert!(evaluate_predicate(&gt, &obj), "3.0 > 1");
+        assert!(evaluate_predicate(&lt, &obj), "3.0 < 5");
+
+        // Out-of-range value fails the window.
+        let mut thin = create_test_obj();
+        put_str(&mut thin, tags::SLICE_THICKNESS, VR::DS, "0.5");
+        assert!(!evaluate_predicate(&gt, &thin), "0.5 is not greater than 1");
+    }
+
+    #[test]
+    fn numeric_predicate_false_for_missing_or_nonnumeric_field() {
+        let obj = create_test_obj(); // no SliceThickness
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        assert!(!evaluate_predicate(&gt, &obj), "missing field => false");
+
+        let mut text = create_test_obj();
+        put_str(&mut text, tags::MODALITY, VR::CS, "CT");
+        let gt_text = Predicate::GreaterThan {
+            field: "Modality".into(),
+            value: "1".into(),
+        };
+        assert!(
+            !evaluate_predicate(&gt_text, &text),
+            "non-numeric field => false"
+        );
+    }
+
+    /// A missing tag must compare equal to "" (CTP `Tag.equals("")` semantics),
+    /// so that translate-ctp's `equals X ""` / `notequals X ""` behaves the same
+    /// as the original CTP `!Tag.equals("")` rules.
+    #[test]
+    fn missing_field_compares_as_empty_string() {
+        let obj = create_test_obj(); // ConversionType / ImageType / Manufacturer absent
+
+        // `equals X ""` is TRUE when X is absent.
+        assert!(
+            evaluate_predicate(
+                &Predicate::Equals {
+                    field: "ConversionType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "equals \"\" should be true for a missing tag"
+        );
+
+        // `notequals X ""` is therefore FALSE when X is absent.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::NotEquals {
+                    field: "ImageType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "notequals \"\" should be false for a missing tag"
+        );
+
+        // A non-empty value still does not match a missing tag.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::Equals {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "equals <non-empty> should be false for a missing tag"
+        );
+        assert!(
+            evaluate_predicate(
+                &Predicate::NotContains {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "notcontains <non-empty> should be true for a missing tag"
         );
     }
 
@@ -585,6 +778,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Blacklist,
                 labels: vec![FilterLabel {
@@ -616,6 +810,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Blacklist,
                 labels: vec![FilterLabel {
@@ -647,6 +842,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist, // graylist, not blacklist
                 labels: vec![FilterLabel {
@@ -682,6 +878,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
@@ -719,6 +916,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
@@ -745,6 +943,72 @@ mod tests {
         assert!(
             regions.is_empty(),
             "non-matching filters should yield no regions"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hex-tag field resolution regression (pixel masking on US images)
+    // -----------------------------------------------------------------------
+
+    /// Predicates referencing tags by bare hex ID (e.g. `00081090`) must
+    /// resolve to the correct DICOM element. Before this fix,
+    /// `get_field_string` only did keyword lookup, silently returning None
+    /// for any hex-tag field — causing graylist labels to never match.
+    #[test]
+    fn hex_tag_field_resolves_in_contains() {
+        let mut obj = create_test_obj();
+        // Tag (0008,1090) = ManufacturerModelName
+        put_str(&mut obj, dicom_core::Tag(0x0008, 0x1090), VR::LO, "LOGIQE9");
+
+        let pred = Predicate::Contains {
+            field: "00081090".into(),
+            value: "LOGIQE9".into(),
+        };
+        assert!(
+            evaluate_predicate(&pred, &obj),
+            "bare hex tag 00081090 should resolve ManufacturerModelName"
+        );
+    }
+
+    #[test]
+    fn hex_tag_field_resolves_in_equals() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::ROWS, VR::US, "720");
+
+        let pred = Predicate::Equals {
+            field: "Rows".into(),
+            value: "720".into(),
+        };
+        assert!(evaluate_predicate(&pred, &obj), "keyword should still work");
+
+        // Now try via hex tag: Rows = (0028,0010) = 00280010
+        put_str(&mut obj, dicom_core::Tag(0x0028, 0x0010), VR::US, "720");
+        let pred_hex = Predicate::Equals {
+            field: "00280010".into(),
+            value: "720".into(),
+        };
+        assert!(
+            evaluate_predicate(&pred_hex, &obj),
+            "bare hex 00280010 should resolve to Rows"
+        );
+    }
+
+    #[test]
+    fn keyword_lookup_still_preferred_over_hex() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::MANUFACTURER, VR::LO, "GE Healthcare");
+
+        assert!(
+            get_field_string(&obj, "Manufacturer").is_some(),
+            "keyword lookup should work"
+        );
+        assert!(
+            get_field_string(&obj, "00080070").is_some(),
+            "hex tag should also work"
+        );
+        assert_eq!(
+            get_field_string(&obj, "Manufacturer"),
+            get_field_string(&obj, "00080070"),
         );
     }
 }

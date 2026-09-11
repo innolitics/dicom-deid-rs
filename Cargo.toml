@@ -14,9 +14,10 @@ dicom-core = "0.9"
 dicom-dictionary-std = "0.9"
 dicom-pixeldata = "0.9"
 sha2 = "0.10"
+quick-xml = "0.37"
 regex = "1"
 thiserror = "2"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 indicatif = { version = "0.17", optional = true }
 rayon = { version = "1", optional = true }
 
@@ -28,3 +29,12 @@ jpeg2000 = ["dicom-pixeldata/openjp2"]
 
 [dev-dependencies]
 tempfile = "3"
+
+# This is working around a bug in openjp2 where dealloc is called on a
+# potentially null pointer. A fix has been proposed in
+# https://github.com/Neopallium/openjp2/pull/11 but is not yet upstream. In the
+# meantime, disable debug assertions on this package to prevent this from
+# causing failures (rust compiler debug assertions flag this as a precondition
+# check failure).
+[profile.dev.package.openjp2]
+debug-assertions = false

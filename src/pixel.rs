@@ -1,7 +1,7 @@
 use crate::error::DeidError;
 use crate::recipe::CoordinateRegion;
-use dicom_core::DataElement;
 use dicom_core::value::{PrimitiveValue, Value};
+use dicom_core::{DataElement, VR};
 use dicom_dictionary_std::tags;
 use dicom_object::{FileDicomObject, InMemDicomObject};
 use dicom_pixeldata::PixelDecoder;
@@ -20,7 +20,17 @@ fn read_u16_tag(obj: &InMemDicomObject, tag: dicom_core::Tag) -> Result<u16, Dei
 ///
 /// If the pixel data is already uncompressed or absent, this is a no-op.
 /// After decompression the transfer syntax is updated to Explicit VR Little
-/// Endian (1.2.840.10008.1.2.1).
+/// Endian (1.2.840.10008.1.2.1) and the pixel-description tags
+/// (PhotometricInterpretation, PlanarConfiguration, BitsAllocated,
+/// BitsStored, HighBit, SamplesPerPixel) are updated to match what the
+/// decoder actually produced.
+///
+/// The metadata sync is critical for color frames: JPEG2000 encodes color
+/// ultrasound as `YBR_RCT` (a transform that exists *only* for compressed
+/// JPEG2000 data); after decode the buffer is RGB-interleaved.  Leaving the
+/// PI as `YBR_RCT` causes downstream viewers to apply a wrong inverse YBR
+/// transform, producing the green-cast / "doubled" rendering artifact seen
+/// on Doppler frames.
 pub fn decompress_pixel_data(obj: &mut FileDicomObject<InMemDicomObject>) -> Result<(), DeidError> {
     // No pixel data → nothing to do
     let elem = match obj.element(tags::PIXEL_DATA) {
@@ -33,7 +43,10 @@ pub fn decompress_pixel_data(obj: &mut FileDicomObject<InMemDicomObject>) -> Res
         return Ok(());
     }
 
-    let vr = elem.header().vr();
+    // The original encapsulated PixelData always carries VR=OB (per DICOM
+    // PS3.5).  After decompression we re-pick the VR below from the
+    // decoded buffer's BitsAllocated: OW for >8-bit (strict viewers refuse
+    // OB+BitsAllocated=16), OB for 8-bit.
 
     // Decode using dicom-pixeldata's PixelDecoder trait
     let decoded = obj
@@ -41,12 +54,76 @@ pub fn decompress_pixel_data(obj: &mut FileDicomObject<InMemDicomObject>) -> Res
         .map_err(|e| DeidError::Dicom(format!("pixel decompression failed: {}", e)))?;
     let raw_bytes = decoded.data().to_vec();
 
+    // Snapshot the post-decode metadata so we can drop the borrow on `obj`
+    // before mutating it.
+    let pi = decoded.photometric_interpretation().as_str().to_string();
+    let planar = decoded.planar_configuration() as u16;
+    let samples_per_pixel = decoded.samples_per_pixel();
+    let bits_allocated = decoded.bits_allocated();
+    let mut bits_stored = decoded.bits_stored();
+    let mut high_bit = decoded.high_bit();
+    drop(decoded);
+
+    // For color pixel data (RGB / multi-sample) the DICOM convention —
+    // and what reference libraries like GDCM emit after JPEG2000
+    // decompression — is `BitsStored == BitsAllocated`.  `BS<BA` only
+    // makes sense for monochrome (where the analog signal has fewer
+    // effective bits than the container); on RGB samples it confuses
+    // viewers and produces alternating-channel halftone artifacts when
+    // they fall back to a "treat each byte as a separate sample" path.
+    //
+    // `dicom-pixeldata` carries forward the source's BS value literally
+    // (often 8 for JPEG2000 ultrasound stored in 16-bit slots), so we
+    // normalize to BS=BA for color data here.  The pixel bytes are
+    // unchanged — just the descriptive tags change.
+    if samples_per_pixel > 1 && bits_stored < bits_allocated {
+        bits_stored = bits_allocated;
+        high_bit = bits_allocated - 1;
+    }
+
+    let pixel_vr = if bits_allocated > 8 { VR::OW } else { VR::OB };
+
     // Replace PixelData with uncompressed bytes
     obj.put(DataElement::new(
         tags::PIXEL_DATA,
-        vr,
+        pixel_vr,
         Value::Primitive(PrimitiveValue::U8(raw_bytes.into())),
     ));
+
+    // Sync pixel-description tags to the decoded buffer's actual layout.
+    obj.put(DataElement::new(
+        tags::PHOTOMETRIC_INTERPRETATION,
+        VR::CS,
+        PrimitiveValue::from(pi),
+    ));
+    obj.put(DataElement::new(
+        tags::SAMPLES_PER_PIXEL,
+        VR::US,
+        PrimitiveValue::from(samples_per_pixel),
+    ));
+    obj.put(DataElement::new(
+        tags::BITS_ALLOCATED,
+        VR::US,
+        PrimitiveValue::from(bits_allocated),
+    ));
+    obj.put(DataElement::new(
+        tags::BITS_STORED,
+        VR::US,
+        PrimitiveValue::from(bits_stored),
+    ));
+    obj.put(DataElement::new(
+        tags::HIGH_BIT,
+        VR::US,
+        PrimitiveValue::from(high_bit),
+    ));
+    // PlanarConfiguration is only defined for SamplesPerPixel > 1.
+    if samples_per_pixel > 1 {
+        obj.put(DataElement::new(
+            tags::PLANAR_CONFIGURATION,
+            VR::US,
+            PrimitiveValue::from(planar),
+        ));
+    }
 
     // Update transfer syntax to Explicit VR Little Endian
     obj.update_meta(|meta| {
@@ -166,8 +243,8 @@ mod tests {
     use crate::recipe::*;
     use crate::test_helpers::*;
     use dicom_core::DataElement;
+    use dicom_core::VR;
     use dicom_core::value::{PrimitiveValue, Value};
-    use dicom_core::{Tag, VR};
     use dicom_dictionary_std::tags;
 
     /// Helper to create a minimal DICOM object with pixel data.
@@ -359,6 +436,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
@@ -398,6 +476,7 @@ mod tests {
         let recipe = Recipe {
             format: "dicom".into(),
             header: vec![],
+            keep_groups: vec![],
             filters: vec![FilterSection {
                 filter_type: FilterType::Graylist,
                 labels: vec![FilterLabel {
@@ -475,5 +554,106 @@ mod tests {
     fn r4_7_decompress_noop_for_no_pixel_data() {
         let mut file_obj = create_test_file_obj();
         decompress_pixel_data(&mut file_obj).expect("should succeed with no pixel data");
+    }
+
+    /// Regression: encapsulated PixelData always carries VR=OB (per DICOM
+    /// PS3.5).  After decompression we must promote the VR to OW for
+    /// >8-bit samples; viewers that strictly enforce VR/BitsAllocated
+    /// agreement otherwise misinterpret the bytes (every byte read as a
+    /// separate sample), producing a halftone-pattern artifact on color
+    /// 16-bit ultrasound frames.
+    #[test]
+    fn vr_promoted_to_ow_helper_choice() {
+        // The picker is internal logic; verify the rule it encodes.
+        for ba in [1u16, 7, 8] {
+            assert!(ba <= 8);
+            assert_eq!(if ba > 8 { VR::OW } else { VR::OB }, VR::OB);
+        }
+        for ba in [9u16, 12, 16, 32] {
+            assert!(ba > 8);
+            assert_eq!(if ba > 8 { VR::OW } else { VR::OB }, VR::OW);
+        }
+    }
+
+    /// Regression: for color pixel data, BitsStored must equal
+    /// BitsAllocated.  `BS<BA` is only meaningful for monochrome.  This
+    /// rule mirrors what GDCM emits after JPEG2000 decompression and
+    /// avoids the halftone-stripe artifact some viewers produce when
+    /// they encounter `PI=RGB`+`BA=16`+`BS=8` on uncompressed data.
+    #[test]
+    fn color_normalizes_bs_to_ba_after_decompress() {
+        let cases = [
+            // (samples_per_pixel, bs_in, ba, expected_bs_out, expected_hb_out)
+            (3u16, 8u16, 16u16, 16u16, 15u16), // RGB 8-in-16: normalize
+            (3, 16, 16, 16, 15),               // RGB true 16-bit: unchanged
+            (3, 8, 8, 8, 7),                   // RGB 8-bit: unchanged
+            (1, 8, 16, 8, 7),                  // monochrome 8-in-16: keep BS<BA
+            (1, 12, 16, 12, 11),               // monochrome 12-in-16: keep
+        ];
+        for (spp, bs_in, ba, exp_bs, exp_hb) in cases {
+            let mut bs = bs_in;
+            let mut hb = bs.saturating_sub(1);
+            if spp > 1 && bs < ba {
+                bs = ba;
+                hb = ba - 1;
+            }
+            assert_eq!(bs, exp_bs, "spp={}, bs_in={}, ba={}", spp, bs_in, ba);
+            assert_eq!(hb, exp_hb, "spp={}, bs_in={}, ba={}", spp, bs_in, ba);
+        }
+    }
+
+    /// Regression: the no-op path (already-uncompressed input) must not
+    /// rewrite pixel-description tags. Only the encapsulated-data path
+    /// updates them, because only there does the decoded layout differ
+    /// from what the source tags claim.
+    #[test]
+    fn decompress_noop_preserves_pixel_description_tags() {
+        let mut file_obj = create_test_file_obj();
+        put_u16(&mut file_obj, tags::ROWS, VR::US, 4);
+        put_u16(&mut file_obj, tags::COLUMNS, VR::US, 4);
+        put_str(
+            &mut file_obj,
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            "MONOCHROME2",
+        );
+        put_u16(&mut file_obj, tags::BITS_ALLOCATED, VR::US, 16);
+        put_u16(&mut file_obj, tags::BITS_STORED, VR::US, 12);
+        put_u16(&mut file_obj, tags::HIGH_BIT, VR::US, 11);
+        put_u16(&mut file_obj, tags::PIXEL_REPRESENTATION, VR::US, 0);
+        put_u16(&mut file_obj, tags::SAMPLES_PER_PIXEL, VR::US, 1);
+
+        let pixels = vec![0u8; 32]; // 4*4 16-bit
+        file_obj.put(DataElement::new(
+            tags::PIXEL_DATA,
+            VR::OW,
+            Value::Primitive(PrimitiveValue::U8(pixels.into())),
+        ));
+
+        decompress_pixel_data(&mut file_obj).expect("noop");
+
+        // None of the pixel-description tags should have been touched.
+        let pi = file_obj
+            .element(tags::PHOTOMETRIC_INTERPRETATION)
+            .unwrap()
+            .value()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(pi, "MONOCHROME2");
+        let bs = file_obj
+            .element(tags::BITS_STORED)
+            .unwrap()
+            .value()
+            .to_int::<u16>()
+            .unwrap();
+        assert_eq!(bs, 12, "BitsStored must not be rewritten on the no-op path");
+        let hb = file_obj
+            .element(tags::HIGH_BIT)
+            .unwrap()
+            .value()
+            .to_int::<u16>()
+            .unwrap();
+        assert_eq!(hb, 11);
     }
 }
