@@ -333,24 +333,19 @@ fn translate_action(action_text: &str, tag: &str) -> Option<String> {
         return Some(format!("REPLACE_ONLY {} var:{}", tag, var_name));
     }
 
-    // Lookup
+    // Lookup. CTP's `@lookup(this, Key, fallback)` maps the element's value
+    // via the lookup table; `fallback` decides what happens on a miss. We map
+    // it to the matching engine function: `empty` -> blank the element,
+    // anything else (`keep`/default) -> keep the original value.
     if action.starts_with("@lookup(") {
         let args = extract_function_args(action).unwrap_or_default();
         let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-        if parts.len() >= 3 {
-            let failure_action = parts[2];
-            if parts.len() >= 4 {
-                return Some(format!(
-                    "REPLACE_ONLY {} func:lookup({},{})",
-                    tag, failure_action, parts[3]
-                ));
-            }
-            return Some(format!(
-                "REPLACE_ONLY {} func:lookup({})",
-                tag, failure_action
-            ));
-        }
-        return Some(format!("REPLACE_ONLY {} func:lookup", tag));
+        let fn_name = if parts.get(2) == Some(&"empty") {
+            "lookup_empty"
+        } else {
+            "lookup"
+        };
+        return Some(format!("REPLACE_ONLY {} func:{}", tag, fn_name));
     }
 
     // Append
@@ -393,8 +388,21 @@ fn translate_action(action_text: &str, tag: &str) -> Option<String> {
     }
 
     // Identifier functions
-    if action.starts_with("@integer(") {
-        return Some(format!("REPLACE {} func:integer", tag));
+    if let Some(rest) = action.strip_prefix("@integer(") {
+        // CTP @integer(SourceField, keytype, width) renumbers `tag` from the
+        // value of SourceField. Carry the source field through so the engine
+        // derives the number from it (e.g. SeriesInstanceUID) rather than from
+        // the target tag's own value.
+        let field = rest
+            .trim_end_matches(')')
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if field.is_empty() {
+            return Some(format!("REPLACE {} func:integer", tag));
+        }
+        return Some(format!("REPLACE {} func:integer({})", tag, field));
     }
     if action.starts_with("@initials(") {
         return Some(format!("REPLACE_ONLY {} func:initials", tag));
@@ -920,9 +928,12 @@ fn emit_predicate(p: &FilterPredicate) -> Option<String> {
         ("endsWith" | "endsWithIgnoreCase", true) => "notcontains",
         ("matches", false) => "contains",
         ("matches", true) => "notcontains",
-        // No native numeric predicate — drop so the rest of the conjunct
-        // still applies, matching the behavior of the previous translator.
-        ("isLessThan" | "isGreaterThan", _) => return None,
+        ("isGreaterThan", false) => "greaterthan",
+        ("isLessThan", false) => "lessthan",
+        // Negated numeric comparison (`!Field.isGreaterThan(v)` => `<= v`) has
+        // no exact predicate in the recipe format; drop it so the rest of the
+        // conjunct still applies.
+        ("isLessThan" | "isGreaterThan", true) => return None,
         _ => return None,
     };
     Some(format!("{} {} {}", kw, p.tag, p.value))
@@ -1375,7 +1386,7 @@ mod tests {
     fn translate_always_integer() {
         assert_eq!(
             translate_action("@always()@integer(SeriesInstanceUID,seriesnum,5)", "T"),
-            Some("REPLACE T func:integer".into())
+            Some("REPLACE T func:integer(SeriesInstanceUID)".into())
         );
     }
 
@@ -1397,17 +1408,19 @@ mod tests {
 
     #[test]
     fn translate_lookup_with_action() {
+        // `keep` fallback maps to the plain lookup (keep original on miss).
         assert_eq!(
             translate_action("@lookup(this,ptid,keep)", "(0010,0020)"),
-            Some("REPLACE_ONLY (0010,0020) func:lookup(keep)".into())
+            Some("REPLACE_ONLY (0010,0020) func:lookup".into())
         );
     }
 
     #[test]
-    fn translate_lookup_with_default() {
+    fn translate_lookup_empty_fallback() {
+        // `empty` fallback maps to lookup_empty (blank the element on miss).
         assert_eq!(
-            translate_action("@lookup(this,ptid,default,ANON)", "(0010,0020)"),
-            Some("REPLACE_ONLY (0010,0020) func:lookup(default,ANON)".into())
+            translate_action("@lookup(this,ptid,empty)", "(0010,0020)"),
+            Some("REPLACE_ONLY (0010,0020) func:lookup_empty".into())
         );
     }
 
@@ -1450,7 +1463,7 @@ mod tests {
     fn translate_integer() {
         assert_eq!(
             translate_action("@integer(SeriesInstanceUID,seriesnum,5)", "T"),
-            Some("REPLACE T func:integer".into())
+            Some("REPLACE T func:integer(SeriesInstanceUID)".into())
         );
     }
 

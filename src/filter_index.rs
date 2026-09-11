@@ -392,11 +392,12 @@ fn dispatch_candidates<'a>(
 // ---------------------------------------------------------------------------
 
 fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomObject) -> bool {
+    // Value-comparison predicates treat a MISSING field as the empty string,
+    // matching CTP semantics. Must stay in sync with
+    // `crate::filter::evaluate_predicate` (the non-indexed evaluator).
     match &condition.predicate {
         Predicate::Contains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             match &condition.compiled_pattern {
                 Some(CompiledPattern::Regex(re)) => re.is_match(&field_val),
                 Some(CompiledPattern::Substring(lower)) => {
@@ -406,9 +407,7 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             }
         }
         Predicate::NotContains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             match &condition.compiled_pattern {
                 Some(CompiledPattern::Regex(re)) => !re.is_match(&field_val),
                 Some(CompiledPattern::Substring(lower)) => {
@@ -417,30 +416,33 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
                 None => !field_val.to_lowercase().contains(&value.to_lowercase()),
             }
         }
-        // For non-regex predicates, delegate to the original evaluator logic inline
         Predicate::Equals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() == value.to_lowercase()
         }
         Predicate::NotEquals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() != value.to_lowercase()
         }
         Predicate::StartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::NotStartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
+        }
+        Predicate::GreaterThan { field, value } => {
+            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a > b,
+                _ => false,
+            }
+        }
+        Predicate::LessThan { field, value } => {
+            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a < b,
+                _ => false,
+            }
         }
         Predicate::Missing { field } => !crate::filter::field_present(obj, field),
         Predicate::Empty { field } => match crate::filter::get_field_string(obj, field) {

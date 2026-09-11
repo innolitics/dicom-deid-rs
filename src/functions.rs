@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Generate a DICOM UID from the SHA-256 hash of the input value.
 ///
@@ -127,14 +127,31 @@ fn round(input: &str) -> Result<String, DeidError> {
     Ok(format!("{}{}", rounded, suffix))
 }
 
-/// Return a deterministic hash-based integer for the input.
+/// Build the stateful `integer` function.
 ///
-/// True sequential integers require shared state which will be added later.
-fn integer(input: &str) -> Result<String, DeidError> {
-    let hash = Sha256::digest(input.as_bytes());
-    let bytes: [u8; 8] = hash[..8].try_into().expect("8 bytes");
-    let num = u64::from_be_bytes(bytes) % 100000;
-    Ok(format!("{:05}", num))
+/// Assigns a stable, unique, sequential number (zero-padded to 5 digits) to each
+/// distinct input value seen during a run. The recipe supplies the *source*
+/// field to key on — e.g. `@integer(SeriesInstanceUID,…)` becomes
+/// `func:integer(SeriesInstanceUID)`, so this receives each series' (unique)
+/// SeriesInstanceUID and renumbers SeriesNumber uniquely per series. Distinct
+/// inputs always get distinct numbers (no hash collisions); the same input is
+/// stable within a run, so every instance of a series gets the same number.
+///
+/// State is per-run (a fresh map is created by `default_functions`), guarded by
+/// a mutex so it is safe to share across the recipe's function table.
+fn make_integer() -> DeidFunction {
+    let assigned: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    Box::new(move |input: &str| -> Result<String, DeidError> {
+        let mut map = assigned
+            .lock()
+            .map_err(|_| DeidError::Dicom("integer: counter mutex poisoned".into()))?;
+        if let Some(existing) = map.get(input) {
+            return Ok(existing.clone());
+        }
+        let value = format!("{:05}", map.len() + 1);
+        map.insert(input.to_string(), value.clone());
+        Ok(value)
+    })
 }
 
 /// Extract initials from DICOM PersonName format (Last^First^Middle).
@@ -240,28 +257,34 @@ pub fn create_lookup_function(
         }
     }
 
-    // Create a lookup function for each tag that has entries
+    // Register two lookup variants that differ only in their no-match
+    // fallback, matching CTP's `@lookup(this, Key, keep|empty)`:
+    //   * "lookup"       -> keep the original value when there is no mapping
+    //   * "lookup_empty" -> blank the element when there is no mapping
+    // Both are keyed by `TagName/Value` input (see metadata::resolve_value).
     let mut functions: HashMap<String, DeidFunction> = HashMap::new();
-
-    // Create a single "lookup" function that handles all tags
     let tag_tables = Arc::new(tag_tables);
-    let lookup_fn: DeidFunction = {
+
+    let make_lookup = |empty_on_miss: bool| -> DeidFunction {
         let tables = Arc::clone(&tag_tables);
         Box::new(move |input: &str| -> Result<String, DeidError> {
-            // Input is the current tag value. We need to search all tag tables
-            // for a matching original value and return the mapped value.
-            // The tag context is passed as "TagName/Value" format.
-            if let Some((tag_name, current_value)) = input.split_once('/')
-                && let Some(table) = tables.get(tag_name)
-                && let Some(mapped) = table.get(current_value)
-            {
-                return Ok(mapped.clone());
+            if let Some((tag_name, current_value)) = input.split_once('/') {
+                if let Some(mapped) = tables.get(tag_name).and_then(|t| t.get(current_value)) {
+                    return Ok(mapped.clone());
+                }
+                return Ok(if empty_on_miss {
+                    String::new()
+                } else {
+                    current_value.to_string()
+                });
             }
-            // No mapping found -- return original value unchanged
+            // No tag context -- return input unchanged.
             Ok(input.to_string())
         })
     };
-    functions.insert("lookup".into(), lookup_fn);
+
+    functions.insert("lookup".into(), make_lookup(false));
+    functions.insert("lookup_empty".into(), make_lookup(true));
 
     Ok(functions)
 }
@@ -327,7 +350,7 @@ pub fn default_functions() -> HashMap<String, DeidFunction> {
     map.insert("time".into(), Box::new(time));
     map.insert("blank".into(), Box::new(blank));
     map.insert("round".into(), Box::new(round));
-    map.insert("integer".into(), Box::new(integer));
+    map.insert("integer".into(), make_integer());
     map.insert("initials".into(), Box::new(initials));
     map.insert("contents".into(), Box::new(contents));
     map.insert("value".into(), Box::new(value));
@@ -503,8 +526,10 @@ mod tests {
         let funcs = create_lookup_function(tmp.path()).unwrap();
         let lookup = &funcs["lookup"];
 
-        assert_eq!(lookup("PatientID/99999").unwrap(), "PatientID/99999");
-        assert_eq!(lookup("Unknown/value").unwrap(), "Unknown/value");
+        // No mapping for the key -> keep the original element value (the part
+        // after the "TagName/" prefix), not the prefixed lookup input.
+        assert_eq!(lookup("PatientID/99999").unwrap(), "99999");
+        assert_eq!(lookup("Unknown/value").unwrap(), "value");
     }
 
     #[test]
@@ -512,7 +537,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let funcs = create_lookup_function(tmp.path()).unwrap();
         let lookup = &funcs["lookup"];
-        assert_eq!(lookup("PatientID/12345").unwrap(), "PatientID/12345");
+        assert_eq!(lookup("PatientID/12345").unwrap(), "12345");
     }
 
     #[test]
@@ -559,6 +584,7 @@ mod tests {
 
     #[test]
     fn integer_five_digits() {
+        let integer = make_integer();
         let result = integer("test input").unwrap();
         assert_eq!(result.len(), 5, "integer should be 5 chars: {}", result);
         assert!(
@@ -569,10 +595,25 @@ mod tests {
     }
 
     #[test]
-    fn integer_deterministic() {
+    fn integer_stable_per_input() {
+        let integer = make_integer();
         let a = integer("hello").unwrap();
         let b = integer("hello").unwrap();
-        assert_eq!(a, b);
+        assert_eq!(a, b, "same input must yield the same number within a run");
+    }
+
+    #[test]
+    fn integer_unique_per_distinct_input() {
+        // Distinct series (distinct SeriesInstanceUIDs) must never collide, even
+        // if they shared an original SeriesNumber.
+        let integer = make_integer();
+        let a = integer("series-uid-A").unwrap();
+        let b = integer("series-uid-B").unwrap();
+        let c = integer("series-uid-C").unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert_eq!(integer("series-uid-A").unwrap(), a, "still stable");
     }
 
     #[test]

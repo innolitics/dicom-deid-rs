@@ -8,6 +8,7 @@ use crate::recipe::Recipe;
 use dicom_core::dictionary::{DataDictionary as _, DataDictionaryEntry as _};
 use dicom_object::{InMemDicomObject, open_file};
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -109,7 +110,13 @@ fn extract_tags(obj: &InMemDicomObject, tag_names: &[&str]) -> TagSnapshot {
 }
 
 /// Build output path from de-identified DICOM tags, matching CTP's structure:
-///   `DATE-{StudyDate}--{Modality}--PID-{PatientID}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm`
+///   `DATE-{StudyDate}--{Modality}--PID-{PatientID}--{StudyUIDHash}/SER-{SeriesNumber}/{SOPInstanceUID}.dcm`
+///
+/// The study folder includes a short StudyInstanceUID hash so that distinct
+/// studies sharing a patient, date, and modality (e.g. a Brain and a Spine MR on
+/// the same day) do not collapse into one folder. Collapsing into a single folder
+/// caused issues when series numbers were re-used across studies, leading to
+/// problems in the image viewer where series weren't properly distinguished.
 fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     let dict = dicom_dictionary_std::StandardDataDictionary;
 
@@ -124,6 +131,7 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
     let study_date = get("StudyDate");
     let modality = get("Modality");
     let patient_id = get("PatientID");
+    let study_instance_uid = get("StudyInstanceUID");
     let series_number = get("SeriesNumber");
     let sop_instance_uid = get("SOPInstanceUID");
 
@@ -155,7 +163,20 @@ fn build_output_path(output_dir: &Path, obj: &InMemDicomObject) -> PathBuf {
         format!("{}.dcm", sop_instance_uid)
     };
 
-    let study_dir = format!("DATE-{}--{}--PID-{}", date_part, modality_part, pid_part);
+    let study_dir = if study_instance_uid.is_empty() {
+        format!("DATE-{}--{}--PID-{}", date_part, modality_part, pid_part)
+    } else {
+        let digest = Sha256::digest(study_instance_uid.as_bytes());
+        let short: String = digest
+            .iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        format!(
+            "DATE-{}--{}--PID-{}--{}",
+            date_part, modality_part, pid_part, short
+        )
+    };
     output_dir.join(study_dir).join(ser_part).join(file_name)
 }
 
@@ -253,7 +274,7 @@ impl DeidPipeline {
         };
         let mut blacklisted_files: Vec<(PathBuf, String)> = Vec::new();
         let mut audit_entries: Vec<AuditEntry> = Vec::new();
-        let log_interval = std::cmp::max(total / 20, 1);
+        let log_interval = std::cmp::max(total / 100, 1);
 
         for (i, file_path) in files.iter().enumerate() {
             match self.process_file(file_path) {
@@ -1033,6 +1054,187 @@ mod tests {
                 .expect("should have PatientName");
             let val = name.value().to_str().expect("should read value");
             assert_eq!(val.as_ref(), "ANON");
+        }
+    }
+
+    /// Two distinct series that share an original SeriesNumber must be renumbered
+    /// to *distinct* numbers (from their SeriesInstanceUID) and land in separate
+    /// output folders — and each series' instances must stay together (no split),
+    /// even though SeriesInstanceUID is itself being replaced in the same run.
+    #[test]
+    fn series_sharing_number_are_separated() {
+        use crate::test_helpers::*;
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        // series A: 3 instances, series B: 2 instances — both original SeriesNumber "3".
+        let mut idx = 0;
+        for (series_uid, count) in [("1.2.111", 3), ("1.2.222", 2)] {
+            for _ in 0..count {
+                let mut obj = create_test_file_obj();
+                put_str(
+                    &mut obj,
+                    tags::SOP_INSTANCE_UID,
+                    VR::UI,
+                    &format!("9.9.{idx}"),
+                );
+                put_str(&mut obj, tags::SERIES_INSTANCE_UID, VR::UI, series_uid);
+                put_str(&mut obj, tags::SERIES_NUMBER, VR::IS, "3");
+                put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20220101");
+                put_str(&mut obj, tags::MODALITY, VR::CS, "MR");
+                put_str(&mut obj, tags::PATIENT_ID, VR::LO, "PID1");
+                obj.write_to_file(input_dir.join(format!("f{idx}.dcm")))
+                    .expect("write test DICOM");
+                idx += 1;
+            }
+        }
+
+        let recipe = "FORMAT dicom\n%header\n\
+            REPLACE SeriesNumber func:integer(SeriesInstanceUID)\n\
+            REPLACE SeriesInstanceUID func:hashuid\n";
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path: tmp.path().join("unused.txt"),
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: false,
+            remove_unspecified_elements: false,
+            quarantine_dir: None,
+        };
+        let pipeline = DeidPipeline::from_recipe_text(recipe, config).expect("create pipeline");
+        pipeline.run().expect("run pipeline");
+
+        // Exactly one study dir; under it, exactly two series folders (3 and 2 files),
+        // and no folder mixes two SeriesInstanceUIDs.
+        let study_dir = fs::read_dir(&output_dir)
+            .expect("read output")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .expect("one study dir");
+        let mut series_sizes: Vec<usize> = Vec::new();
+        for entry in fs::read_dir(&study_dir).expect("read study") {
+            let series_dir = entry.expect("entry").path();
+            if !series_dir.is_dir() {
+                continue;
+            }
+            let files: Vec<_> = fs::read_dir(&series_dir)
+                .expect("read series")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            let uids: std::collections::HashSet<String> = files
+                .iter()
+                .map(|f| {
+                    open_file(f)
+                        .unwrap()
+                        .element_by_name("SeriesInstanceUID")
+                        .unwrap()
+                        .value()
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(uids.len(), 1, "a series folder must hold a single series");
+            series_sizes.push(files.len());
+        }
+        series_sizes.sort_unstable();
+        assert_eq!(
+            series_sizes,
+            vec![2, 3],
+            "two distinct series must map to two folders (sizes 2 and 3), not merge or split"
+        );
+    }
+
+    /// Two distinct studies that share a patient, date, and modality (e.g. a
+    /// Brain and a Spine MR taken the same day) must land in *separate* output
+    /// study folders — otherwise their same-numbered series (SeriesNumber is only
+    /// unique within a study) would collide into one SER folder and interleave.
+    #[test]
+    fn distinct_studies_same_patient_date_are_separated() {
+        use crate::test_helpers::*;
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let input_dir = tmp.path().join("input");
+        let output_dir = tmp.path().join("output");
+        fs::create_dir_all(&input_dir).expect("create input dir");
+
+        // Two studies, same patient/date/modality, each with a SeriesNumber 3.
+        let mut idx = 0;
+        for study_uid in ["1.2.100.A", "1.2.100.B"] {
+            for _ in 0..2 {
+                let mut obj = create_test_file_obj();
+                put_str(
+                    &mut obj,
+                    tags::SOP_INSTANCE_UID,
+                    VR::UI,
+                    &format!("9.9.{idx}"),
+                );
+                put_str(&mut obj, tags::STUDY_INSTANCE_UID, VR::UI, study_uid);
+                put_str(
+                    &mut obj,
+                    tags::SERIES_INSTANCE_UID,
+                    VR::UI,
+                    &format!("{study_uid}.3"),
+                );
+                put_str(&mut obj, tags::SERIES_NUMBER, VR::IS, "3");
+                put_str(&mut obj, tags::STUDY_DATE, VR::DA, "20240402");
+                put_str(&mut obj, tags::MODALITY, VR::CS, "MR");
+                put_str(&mut obj, tags::PATIENT_ID, VR::LO, "PID1");
+                obj.write_to_file(input_dir.join(format!("f{idx}.dcm")))
+                    .expect("write test DICOM");
+                idx += 1;
+            }
+        }
+
+        // Recipe does NOT renumber SeriesNumber, so separation must come from the
+        // study folder being keyed on StudyInstanceUID.
+        let config = DeidConfig {
+            input_dir,
+            output_dir: output_dir.clone(),
+            recipe_path: tmp.path().join("unused.txt"),
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            remove_private_tags: false,
+            remove_unspecified_elements: false,
+            quarantine_dir: None,
+        };
+        let pipeline = DeidPipeline::from_recipe_text("FORMAT dicom\n%header\n", config)
+            .expect("create pipeline");
+        pipeline.run().expect("run pipeline");
+
+        let study_dirs: Vec<_> = fs::read_dir(&output_dir)
+            .expect("read output")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(
+            study_dirs.len(),
+            2,
+            "two distinct studies must produce two study folders, not merge"
+        );
+        for sd in &study_dirs {
+            let ser: Vec<_> = fs::read_dir(sd)
+                .expect("read study")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            assert_eq!(
+                ser.len(),
+                1,
+                "each study folder holds its own single series"
+            );
         }
     }
 

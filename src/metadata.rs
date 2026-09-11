@@ -79,8 +79,15 @@ pub(crate) fn apply_dataset_actions(
 ) -> Result<(), DeidError> {
     let winning = resolve_winning_actions(actions, |action| resolve_tags(&action.tag, obj))?;
 
-    // Apply each winning action
-    for (tag, action) in &winning {
+    // Apply each winning action in a deterministic (tag-ordered) sequence.
+    // HashMap iteration order is unspecified; a fixed order ensures functions
+    // that read another element (e.g. `func:integer(SeriesInstanceUID)`) see a
+    // consistent value across every instance of a series, so a series is
+    // renumbered identically for all of its files (no split) while distinct
+    // series still get distinct numbers.
+    let mut ordered: Vec<(Tag, &HeaderAction)> = winning.iter().map(|(t, a)| (*t, *a)).collect();
+    ordered.sort_by_key(|(tag, _)| (tag.group(), tag.element()));
+    for (tag, action) in &ordered {
         if file_meta::is_file_meta(*tag) {
             continue;
         }
@@ -343,6 +350,8 @@ pub fn apply_file_meta_actions(
                 &action.value,
                 variables,
                 functions,
+                obj,
+                tag,
                 &current,
             )?)
         } else {
@@ -511,17 +520,21 @@ fn resolve_value(
         .and_then(|e| e.value().to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_default();
-    resolve_value_from(value, variables, functions, &current)
+    resolve_value_from(value, variables, functions, obj, tag, &current)
 }
 
 /// Resolve an action value given the target attribute's current value directly.
 ///
 /// The file meta group is not element-addressable, so its actions supply the
-/// current value here rather than having it looked up in a data set.
+/// current value here rather than having it looked up in a data set. `obj` and
+/// `tag` are still needed: a `func:name(SourceElement)` argument reads its input
+/// from the data set, and `func:lookup*` keys its table by the target's keyword.
 fn resolve_value_from(
     value: &Option<ActionValue>,
     variables: &HashMap<String, String>,
     functions: &HashMap<String, DeidFunction>,
+    obj: &InMemDicomObject,
+    tag: Tag,
     current: &str,
 ) -> Result<String, DeidError> {
     match value {
@@ -530,11 +543,40 @@ fn resolve_value_from(
             .get(name)
             .cloned()
             .ok_or_else(|| DeidError::VariableNotFound(name.clone())),
-        Some(ActionValue::Function { name, .. }) => {
+        Some(ActionValue::Function { name, args }) => {
             let func = functions
                 .get(name)
                 .ok_or_else(|| DeidError::FunctionNotFound(name.clone()))?;
-            func(current)
+            // A function may name a source element to read its input from — e.g.
+            // `func:integer(SeriesInstanceUID)` renumbers SeriesNumber from the
+            // (unique) SeriesInstanceUID. The source element is always looked up
+            // in the data set; with no source named, the function operates on
+            // `current`, the value of the attribute being replaced.
+            let source_elem = args
+                .first()
+                .and_then(|field| StandardDataDictionary.by_name(field))
+                .and_then(|entry| obj.element(entry.tag()).ok());
+            let current = match source_elem {
+                Some(elem) => elem
+                    .value()
+                    .to_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                None => current.to_string(),
+            };
+            // The lookup function is keyed by `TagName/Value` so a single
+            // table can map multiple tags; prefix the element's DICOM keyword
+            // so it can resolve the right per-tag mapping. Other functions
+            // receive the raw element value.
+            if name.starts_with("lookup") {
+                let keyword = StandardDataDictionary
+                    .by_tag(tag)
+                    .map(|e| e.alias)
+                    .unwrap_or("");
+                func(&format!("{}/{}", keyword, current))
+            } else {
+                func(&current)
+            }
         }
         None => Ok(String::new()),
     }

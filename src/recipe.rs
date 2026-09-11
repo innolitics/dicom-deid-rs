@@ -65,6 +65,12 @@ pub enum Predicate {
     NotEquals { field: String, value: String },
     StartsWith { field: String, value: String },
     NotStartsWith { field: String, value: String },
+    /// Numeric comparison: field value (parsed as a number) is strictly
+    /// greater than `value`. Maps to CTP `isGreaterThan`.
+    GreaterThan { field: String, value: String },
+    /// Numeric comparison: field value (parsed as a number) is strictly
+    /// less than `value`. Maps to CTP `isLessThan`.
+    LessThan { field: String, value: String },
     Missing { field: String },
     Empty { field: String },
     Present { field: String },
@@ -165,6 +171,8 @@ const PREDICATE_KEYWORDS: &[&str] = &[
     "notcontains",
     "notequals",
     "startswith",
+    "greaterthan",
+    "lessthan",
     "contains",
     "equals",
     "missing",
@@ -538,6 +546,12 @@ fn parse_predicate(text: &str) -> Result<Predicate, DeidError> {
     } else if let Some(rest) = text.strip_prefix("startswith ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::StartsWith { field, value })
+    } else if let Some(rest) = text.strip_prefix("greaterthan ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::GreaterThan { field, value })
+    } else if let Some(rest) = text.strip_prefix("lessthan ") {
+        let (field, value) = split_field_value(rest.trim())?;
+        Ok(Predicate::LessThan { field, value })
     } else if let Some(rest) = text.strip_prefix("contains ") {
         let (field, value) = split_field_value(rest.trim())?;
         Ok(Predicate::Contains { field, value })

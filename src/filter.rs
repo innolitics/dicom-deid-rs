@@ -64,11 +64,16 @@ pub fn field_present(obj: &InMemDicomObject, field: &str) -> bool {
 ///
 /// Field names in predicates are resolved to DICOM tags by keyword lookup.
 pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool {
+    // Value-comparison predicates (contains/equals/startswith and negations)
+    // treat a MISSING field as the empty string, matching CTP's DicomFilter:
+    // in CTP `Tag.equals("")` is true when the tag is absent. This is what lets
+    // `!ConversionType.equals("")` / `ImageType.equals("")` style gauntlet rules
+    // round-trip correctly through translate-ctp's DNF expansion (which turns
+    // them into positive `equals X ""` conditions). The `missing`/`empty`/
+    // `present` predicates below keep their distinct present-vs-absent meaning.
     match predicate {
         Predicate::Contains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => re.is_match(&field_val),
@@ -76,9 +81,7 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::NotContains { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             let pattern = format!("(?i){}", value);
             match Regex::new(&pattern) {
                 Ok(re) => !re.is_match(&field_val),
@@ -86,27 +89,19 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             }
         }
         Predicate::Equals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() == value.to_lowercase()
         }
         Predicate::NotEquals { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase() != value.to_lowercase()
         }
         Predicate::StartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return false;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::NotStartsWith { field, value } => {
-            let Some(field_val) = get_field_string(obj, field) else {
-                return true;
-            };
+            let field_val = get_field_string(obj, field).unwrap_or_default();
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::Missing { field } => !field_present(obj, field),
@@ -120,8 +115,32 @@ pub fn evaluate_predicate(predicate: &Predicate, obj: &InMemDicomObject) -> bool
             },
             None => false,
         },
+        Predicate::GreaterThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a > b,
+                _ => false,
+            }
+        }
+        Predicate::LessThan { field, value } => {
+            match (numeric_field(obj, field), value.parse::<f64>()) {
+                (Some(a), Ok(b)) => a < b,
+                _ => false,
+            }
+        }
         Predicate::Present { field } => field_present(obj, field),
     }
+}
+
+/// Resolve a DICOM field to a number for numeric comparisons.
+///
+/// DICOM numeric strings (DS/IS) may be multi-valued (backslash-separated);
+/// only the first value is used. Returns `None` when the field is missing or
+/// the value does not parse as a number, so numeric predicates are `false`
+/// for absent/non-numeric fields (matching CTP's `isGreaterThan`/`isLessThan`).
+pub(crate) fn numeric_field(obj: &InMemDicomObject, field: &str) -> Option<f64> {
+    let raw = get_field_string(obj, field)?;
+    let first = raw.split('\\').next().unwrap_or("").trim();
+    first.parse::<f64>().ok()
 }
 
 /// Evaluate a list of conditions with logical operators against a DICOM object.
@@ -350,6 +369,106 @@ mod tests {
         assert!(
             !evaluate_predicate(&pred, &obj),
             "notequals should be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn greaterthan_and_lessthan_compare_numeric_values() {
+        let mut obj = create_test_obj();
+        put_str(&mut obj, tags::SLICE_THICKNESS, VR::DS, "3.0");
+
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        let lt = Predicate::LessThan {
+            field: "SliceThickness".into(),
+            value: "5".into(),
+        };
+        assert!(evaluate_predicate(&gt, &obj), "3.0 > 1");
+        assert!(evaluate_predicate(&lt, &obj), "3.0 < 5");
+
+        // Out-of-range value fails the window.
+        let mut thin = create_test_obj();
+        put_str(&mut thin, tags::SLICE_THICKNESS, VR::DS, "0.5");
+        assert!(
+            !evaluate_predicate(&gt, &thin),
+            "0.5 is not greater than 1"
+        );
+    }
+
+    #[test]
+    fn numeric_predicate_false_for_missing_or_nonnumeric_field() {
+        let obj = create_test_obj(); // no SliceThickness
+        let gt = Predicate::GreaterThan {
+            field: "SliceThickness".into(),
+            value: "1".into(),
+        };
+        assert!(!evaluate_predicate(&gt, &obj), "missing field => false");
+
+        let mut text = create_test_obj();
+        put_str(&mut text, tags::MODALITY, VR::CS, "CT");
+        let gt_text = Predicate::GreaterThan {
+            field: "Modality".into(),
+            value: "1".into(),
+        };
+        assert!(
+            !evaluate_predicate(&gt_text, &text),
+            "non-numeric field => false"
+        );
+    }
+
+    /// A missing tag must compare equal to "" (CTP `Tag.equals("")` semantics),
+    /// so that translate-ctp's `equals X ""` / `notequals X ""` behaves the same
+    /// as the original CTP `!Tag.equals("")` rules.
+    #[test]
+    fn missing_field_compares_as_empty_string() {
+        let obj = create_test_obj(); // ConversionType / ImageType / Manufacturer absent
+
+        // `equals X ""` is TRUE when X is absent.
+        assert!(
+            evaluate_predicate(
+                &Predicate::Equals {
+                    field: "ConversionType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "equals \"\" should be true for a missing tag"
+        );
+
+        // `notequals X ""` is therefore FALSE when X is absent.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::NotEquals {
+                    field: "ImageType".into(),
+                    value: "".into(),
+                },
+                &obj
+            ),
+            "notequals \"\" should be false for a missing tag"
+        );
+
+        // A non-empty value still does not match a missing tag.
+        assert!(
+            !evaluate_predicate(
+                &Predicate::Equals {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "equals <non-empty> should be false for a missing tag"
+        );
+        assert!(
+            evaluate_predicate(
+                &Predicate::NotContains {
+                    field: "Manufacturer".into(),
+                    value: "SIEMENS".into(),
+                },
+                &obj
+            ),
+            "notcontains <non-empty> should be true for a missing tag"
         );
     }
 
