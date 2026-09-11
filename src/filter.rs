@@ -391,10 +391,7 @@ mod tests {
         // Out-of-range value fails the window.
         let mut thin = create_test_obj();
         put_str(&mut thin, tags::SLICE_THICKNESS, VR::DS, "0.5");
-        assert!(
-            !evaluate_predicate(&gt, &thin),
-            "0.5 is not greater than 1"
-        );
+        assert!(!evaluate_predicate(&gt, &thin), "0.5 is not greater than 1");
     }
 
     #[test]

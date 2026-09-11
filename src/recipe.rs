@@ -59,21 +59,51 @@ pub enum LogicalOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {
-    Contains { field: String, value: String },
-    NotContains { field: String, value: String },
-    Equals { field: String, value: String },
-    NotEquals { field: String, value: String },
-    StartsWith { field: String, value: String },
-    NotStartsWith { field: String, value: String },
+    Contains {
+        field: String,
+        value: String,
+    },
+    NotContains {
+        field: String,
+        value: String,
+    },
+    Equals {
+        field: String,
+        value: String,
+    },
+    NotEquals {
+        field: String,
+        value: String,
+    },
+    StartsWith {
+        field: String,
+        value: String,
+    },
+    NotStartsWith {
+        field: String,
+        value: String,
+    },
     /// Numeric comparison: field value (parsed as a number) is strictly
     /// greater than `value`. Maps to CTP `isGreaterThan`.
-    GreaterThan { field: String, value: String },
+    GreaterThan {
+        field: String,
+        value: String,
+    },
     /// Numeric comparison: field value (parsed as a number) is strictly
     /// less than `value`. Maps to CTP `isLessThan`.
-    LessThan { field: String, value: String },
-    Missing { field: String },
-    Empty { field: String },
-    Present { field: String },
+    LessThan {
+        field: String,
+        value: String,
+    },
+    Missing {
+        field: String,
+    },
+    Empty {
+        field: String,
+    },
+    Present {
+        field: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -988,30 +988,97 @@ mod tests {
 
     // -- r-1-3 (parallel) ----------------------------------------------------
 
-    /// Requirement r-1-3: run_parallel produces same results as sequential run
+    /// Every de-identified file produced under `output_dir`, as
+    /// (path relative to `output_dir`, PatientName), sorted for comparison.
+    #[cfg(test)]
+    fn collect_outputs(output_dir: &Path) -> Vec<(PathBuf, String)> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "dcm") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(output_dir, &mut files);
+        let mut collected: Vec<(PathBuf, String)> = files
+            .into_iter()
+            .map(|path| {
+                let obj = open_file(&path).expect("should open output");
+                let name = obj
+                    .element_by_name("PatientName")
+                    .expect("should have PatientName")
+                    .value()
+                    .to_str()
+                    .expect("should read value")
+                    .to_string();
+                let relative = path
+                    .strip_prefix(output_dir)
+                    .expect("output path is under output_dir")
+                    .to_path_buf();
+                (relative, name)
+            })
+            .collect();
+        collected.sort();
+        collected
+    }
+
+    /// `run_parallel` must produce the same results as a sequential `run`: the
+    /// same set of output paths, each holding the same de-identified values.
+    ///
+    /// Output paths are derived from the de-identified tags
+    /// (see `build_output_path`), so the inputs carry the tags that determine
+    /// them — without a distinct SOPInstanceUID per instance every file would
+    /// resolve to the same path and overwrite the previous one.
+    ///
+    /// Only the DICOM outputs are compared; the audit CSVs are written once at
+    /// the end of a run and their row order is not part of this guarantee.
     #[cfg(feature = "parallel")]
     #[test]
-    fn r1_3_run_parallel_produces_same_results() {
+    fn run_parallel_produces_same_results_as_sequential() {
         use crate::test_helpers::*;
+        use dicom_core::VR;
+        use dicom_dictionary_std::tags;
 
         let tmp = TempDir::new().expect("should create temp dir");
         let input_dir = tmp.path().join("input");
-        let output_dir = tmp.path().join("output");
+        let sequential_dir = tmp.path().join("sequential");
+        let parallel_dir = tmp.path().join("parallel");
         fs::create_dir_all(&input_dir).expect("create input dir");
 
+        // Five instances spread over two series of one study, each instance
+        // uniquely identified so it maps to its own output path.
         for i in 0..5 {
             let mut file_obj = create_test_file_obj();
+            put_str(&mut file_obj, tags::PATIENT_NAME, VR::PN, "John^Doe");
+            put_str(&mut file_obj, tags::PATIENT_ID, VR::LO, "PID001");
+            put_str(&mut file_obj, tags::MODALITY, VR::CS, "CT");
+            put_str(&mut file_obj, tags::STUDY_DATE, VR::DA, "20250101");
+            put_str(&mut file_obj, tags::STUDY_INSTANCE_UID, VR::UI, "1.2.100");
             put_str(
                 &mut file_obj,
-                dicom_dictionary_std::tags::PATIENT_NAME,
-                dicom_core::VR::PN,
-                &format!("Patient^{}", i),
+                tags::SERIES_INSTANCE_UID,
+                VR::UI,
+                &format!("1.2.200.{}", i % 2),
             );
             put_str(
                 &mut file_obj,
-                dicom_dictionary_std::tags::MODALITY,
-                dicom_core::VR::CS,
-                "CT",
+                tags::SERIES_NUMBER,
+                VR::IS,
+                &format!("{}", i % 2),
+            );
+            put_str(
+                &mut file_obj,
+                tags::SOP_INSTANCE_UID,
+                VR::UI,
+                &format!("1.2.300.{}", i),
             );
             file_obj
                 .write_to_file(input_dir.join(format!("test_{}.dcm", i)))
@@ -1025,10 +1092,10 @@ mod tests {
         )
         .expect("write recipe");
 
-        let config = DeidConfig {
+        let make_config = |output_dir: &Path| DeidConfig {
             input_dir: input_dir.clone(),
-            output_dir: output_dir.clone(),
-            recipe_path,
+            output_dir: output_dir.to_path_buf(),
+            recipe_path: recipe_path.clone(),
             variables: HashMap::new(),
             functions: HashMap::new(),
             remove_private_tags: true,
@@ -1036,25 +1103,40 @@ mod tests {
             quarantine_dir: None,
         };
 
-        let pipeline = DeidPipeline::new(config).expect("should create pipeline");
-        let report = pipeline
+        let sequential_report = DeidPipeline::new(make_config(&sequential_dir))
+            .expect("should create pipeline")
+            .run()
+            .expect("should run sequential pipeline");
+        let parallel_report = DeidPipeline::new(make_config(&parallel_dir))
+            .expect("should create pipeline")
             .run_parallel(2, |_, _, _| {})
             .expect("should run parallel pipeline");
 
-        assert_eq!(report.files_processed, 5);
-        assert_eq!(report.files_skipped, 0);
-        assert_eq!(report.files_blacklisted, 0);
-
-        for i in 0..5 {
-            let output_file = output_dir.join(format!("test_{}.dcm", i));
-            assert!(output_file.exists(), "output file {} should exist", i);
-            let result_obj = open_file(&output_file).expect("should open output");
-            let name = result_obj
-                .element_by_name("PatientName")
-                .expect("should have PatientName");
-            let val = name.value().to_str().expect("should read value");
-            assert_eq!(val.as_ref(), "ANON");
+        for (label, report) in [
+            ("sequential", &sequential_report),
+            ("parallel", &parallel_report),
+        ] {
+            assert_eq!(report.files_processed, 5, "{label}: files_processed");
+            assert_eq!(report.files_skipped, 0, "{label}: files_skipped");
+            assert_eq!(report.files_blacklisted, 0, "{label}: files_blacklisted");
         }
+
+        let sequential = collect_outputs(&sequential_dir);
+        let parallel = collect_outputs(&parallel_dir);
+
+        assert_eq!(
+            sequential.len(),
+            5,
+            "each input must map to its own output path, got {sequential:?}"
+        );
+        assert_eq!(
+            sequential, parallel,
+            "parallel output must match sequential output"
+        );
+        assert!(
+            sequential.iter().all(|(_, name)| name == "ANON"),
+            "every output should be de-identified, got {sequential:?}"
+        );
     }
 
     /// Two distinct series that share an original SeriesNumber must be renumbered

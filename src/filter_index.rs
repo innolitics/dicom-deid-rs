@@ -433,13 +433,19 @@ fn evaluate_predicate_compiled(condition: &CompiledCondition, obj: &InMemDicomOb
             !field_val.to_lowercase().starts_with(&value.to_lowercase())
         }
         Predicate::GreaterThan { field, value } => {
-            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+            match (
+                crate::filter::numeric_field(obj, field),
+                value.parse::<f64>(),
+            ) {
                 (Some(a), Ok(b)) => a > b,
                 _ => false,
             }
         }
         Predicate::LessThan { field, value } => {
-            match (crate::filter::numeric_field(obj, field), value.parse::<f64>()) {
+            match (
+                crate::filter::numeric_field(obj, field),
+                value.parse::<f64>(),
+            ) {
                 (Some(a), Ok(b)) => a < b,
                 _ => false,
             }
