@@ -6,7 +6,7 @@ use crate::metadata::DeidFunction;
 use crate::pixel;
 use crate::recipe::Recipe;
 use dicom_core::dictionary::{DataDictionary as _, DataDictionaryEntry as _};
-use dicom_object::{InMemDicomObject, open_file};
+use dicom_object::InMemDicomObject;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -339,7 +339,10 @@ impl DeidPipeline {
     }
 
     pub fn process_file(&self, file_path: &Path) -> Result<FileOutcome, DeidError> {
-        let mut obj = open_file(file_path).map_err(|e| {
+        let bytes = std::fs::read(file_path).map_err(|e| {
+            DeidError::Dicom(format!("failed to open {}: {}", file_path.display(), e))
+        })?;
+        let mut obj = crate::parse::read_file(&bytes).map_err(|e| {
             DeidError::Dicom(format!("failed to open {}: {}", file_path.display(), e))
         })?;
 
@@ -746,6 +749,7 @@ fn find_dicom_files_recursive(dir: &Path, results: &mut Vec<PathBuf>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dicom_object::open_file;
     use std::fs;
     use tempfile::TempDir;
 
